@@ -111,14 +111,24 @@ pub fn replay_run(
     run_id: &str,
     replacement: Option<&modules::ModuleGraph>,
 ) -> Result<RunOutput, HostError> {
-    let (recorded, policy, mut session) =
+    let (recorded, policy, session) =
         Session::resume(journal, run_id).map_err(|message| HostError {
             filename: run_id.into(),
             message,
             output: RunOutput::default(),
         })?;
-    let parked = session.journal.get_run(run_id).map_err(|e| HostError {
-        filename: run_id.into(),
+    replay_session(recorded, policy, session, replacement)
+}
+
+pub(crate) fn replay_session(
+    recorded: modules::ModuleGraph,
+    policy: Policy,
+    mut session: Session,
+    replacement: Option<&modules::ModuleGraph>,
+) -> Result<RunOutput, HostError> {
+    let run_id = session.run_id.clone();
+    let parked = session.journal.get_run(&run_id).map_err(|e| HostError {
+        filename: run_id.clone(),
         message: e.to_string(),
         output: RunOutput::default(),
     })?;
@@ -136,9 +146,9 @@ pub fn replay_run(
         });
     }
     if parked.status == "parked"
-        && crate::core::durability::can_remain_parked(&session.journal, run_id).map_err(
+        && crate::core::durability::can_remain_parked(&session.journal, &run_id).map_err(
             |message| HostError {
-                filename: run_id.into(),
+                filename: run_id.clone(),
                 message,
                 output: RunOutput::default(),
             },
@@ -152,9 +162,9 @@ pub fn replay_run(
     if !session.is_sealed() {
         session
             .journal
-            .set_status(run_id, "running")
+            .set_status(&run_id, "running")
             .map_err(|error| HostError {
-                filename: run_id.into(),
+                filename: run_id.clone(),
                 message: error.to_string(),
                 output: RunOutput::default(),
             })?;

@@ -318,3 +318,38 @@ fn wake_batch_keeps_successes_and_continues_after_a_failed_run() {
     );
     assert_eq!(outcomes[2].result.as_ref().unwrap().stdout, "third\n");
 }
+
+#[test]
+fn concurrent_wake_batches_skip_live_owners_and_return_one_outcome() {
+    let witness = Witness::new(200, "{}");
+    let project = Project::new(&format!("await ondure.approve({{action:'continue'}}); await new Promise(resolve => setTimeout(resolve, 100)); await fetch('{}'); console.log('done');", witness.url()));
+    run_durable(
+        &Policy { net: true },
+        &project.graph(),
+        &project.journal(),
+        "recover",
+    )
+    .unwrap();
+    let path = project.journal();
+    let mut journal = Journal::open(&path).unwrap();
+    let seq = journal.waits("recover").unwrap()[0].seq;
+    journal.answer_wait("recover", seq, "true").unwrap();
+    let barrier = Barrier::new(2);
+    let batches = thread::scope(|scope| {
+        let one = scope.spawn(|| {
+            barrier.wait();
+            wake_ready(&path).unwrap()
+        });
+        let two = scope.spawn(|| {
+            barrier.wait();
+            wake_ready(&path).unwrap()
+        });
+        [one.join().unwrap(), two.join().unwrap()]
+    });
+    let outcomes: Vec<_> = batches.into_iter().flatten().collect();
+    assert_eq!(outcomes.len(), 1);
+    let run = outcomes.into_iter().next().unwrap().result.unwrap();
+    assert_eq!(run.status, "done");
+    assert_eq!(run.stdout, "done\n");
+    assert_eq!(witness.finish(), 1);
+}

@@ -116,3 +116,111 @@ fn request_retries_return_same_run_and_changed_content_conflicts() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("conflicts"));
 }
+
+#[test]
+fn wake_recovers_a_killed_resumption_without_repeating_completed_http() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (stalled_tx, stalled_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut paths = Vec::new();
+        for request in 0..3 {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return paths;
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("witness accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut headers = Vec::new();
+            while !headers.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut buffer = [0; 1024];
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return paths,
+                    Ok(size) => headers.extend_from_slice(&buffer[..size]),
+                }
+            }
+            paths.push(
+                String::from_utf8_lossy(&headers)
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned(),
+            );
+            if request == 1 {
+                let _ = stalled_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            } else {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .unwrap();
+            }
+        }
+        paths
+    });
+    let project = Project::new(&format!("await fetch('{url}/before'); await ondure.approve({{action:'continue'}}); await fetch('{url}/after'); console.log('finished');"));
+    fs::write(project.0.join("ondure.yaml"), "permissions: [net]").unwrap();
+    assert!(project
+        .run(&["run", "agent.ts", "--run-id", "recover"])
+        .status
+        .success());
+    let path = project.0.join(".ondure/journal.sqlite3");
+    let mut journal = runtime::Journal::open(&path).unwrap();
+    let seq = journal.waits("recover").unwrap()[0].seq;
+    journal.answer_wait("recover", seq, "true").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ondure"))
+        .current_dir(&project.0)
+        .args(["replay", "recover"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stalled = stalled_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    let _ = child.kill();
+    child.wait().unwrap();
+    let _ = release_tx.send(());
+    assert!(
+        stalled,
+        "resumption did not submit its unfinished HTTP operation"
+    );
+    assert_eq!(journal.get_run("recover").unwrap().status, "running");
+    fs::remove_file(project.0.join("agent.ts")).unwrap();
+    let output = project.run(&["wake"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"finished\n");
+    assert_eq!(journal.get_run("recover").unwrap().status, "done");
+    assert!(project.run(&["wake"]).stdout.is_empty());
+    let paths = server.join().unwrap();
+    assert_eq!(
+        paths,
+        [
+            "GET /before HTTP/1.1",
+            "GET /after HTTP/1.1",
+            "GET /after HTTP/1.1"
+        ]
+    );
+}

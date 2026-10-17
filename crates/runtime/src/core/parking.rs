@@ -15,6 +15,11 @@ pub(crate) struct RunLease {
 
 impl RunLease {
     pub(crate) fn acquire(journal_path: &Path, run_id: &str) -> Result<Self, String> {
+        Self::try_acquire(journal_path, run_id)?
+            .ok_or_else(|| format!("run {run_id} is already running"))
+    }
+
+    pub(crate) fn try_acquire(journal_path: &Path, run_id: &str) -> Result<Option<Self>, String> {
         let canonical = if journal_path.exists() {
             journal_path.canonicalize()
         } else {
@@ -40,8 +45,8 @@ impl RunLease {
             .open(directory.join(name))
             .map_err(|error| format!("run lease: {error}"))?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(TryLockError::WouldBlock) => Err(format!("run {run_id} is already running")),
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(format!("run lease: {error}")),
         }
     }

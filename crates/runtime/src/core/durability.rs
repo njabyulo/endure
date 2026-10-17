@@ -90,8 +90,16 @@ impl Session {
     }
 
     pub(crate) fn resume(path: &Path, id: &str) -> Result<(ModuleGraph, Policy, Self), String> {
-        let journal = Journal::open(path).map_err(|e| e.to_string())?;
         let lease = RunLease::acquire(path, &format!("run:{id}"))?;
+        Self::resume_with_lease(path, id, lease)
+    }
+
+    pub(crate) fn resume_with_lease(
+        path: &Path,
+        id: &str,
+        lease: RunLease,
+    ) -> Result<(ModuleGraph, Policy, Self), String> {
+        let journal = Journal::open(path).map_err(|e| e.to_string())?;
         let record = journal.get_run(id).map_err(|e| e.to_string())?;
         let snapshot: Value = serde_json::from_str(&record.graph).map_err(|e| e.to_string())?;
         let graph: ModuleGraph =
@@ -490,7 +498,7 @@ pub struct WakeOutcome {
     pub result: Result<super::journal::RunRecord, crate::HostError>,
 }
 
-/// Wake parked runs whose recorded timer deadline or approval is ready.
+/// Recover abandoned runs and wake ready waits, skipping runs with live owners.
 pub fn wake_ready(path: &Path) -> Result<Vec<WakeOutcome>, crate::HostError> {
     let fail = |message| crate::HostError {
         filename: path.display().to_string(),
@@ -499,15 +507,100 @@ pub fn wake_ready(path: &Path) -> Result<Vec<WakeOutcome>, crate::HostError> {
     };
     let journal = Journal::open(path).map_err(|e| fail(e.to_string()))?;
     let mut awakened = Vec::new();
-    for run in journal.parked_runs().map_err(|e| fail(e.to_string()))? {
-        if !can_remain_parked(&journal, &run.id).map_err(fail)? {
-            let result = crate::replay_run(path, &run.id, None)
-                .and_then(|_| journal.get_run(&run.id).map_err(|e| fail(e.to_string())));
-            awakened.push(WakeOutcome {
-                run_id: run.id,
-                result,
-            });
-        }
+    for run in journal
+        .recoverable_runs()
+        .map_err(|e| fail(e.to_string()))?
+    {
+        let result = match wake_run(path, &journal, &run.id) {
+            Ok(None) => continue,
+            Ok(Some(run)) => Ok(run),
+            Err(error) => Err(error),
+        };
+        awakened.push(WakeOutcome {
+            run_id: run.id,
+            result,
+        });
     }
     Ok(awakened)
+}
+
+fn wake_run(
+    path: &Path,
+    journal: &Journal,
+    run_id: &str,
+) -> Result<Option<super::journal::RunRecord>, crate::HostError> {
+    let fail = |message| crate::HostError {
+        filename: run_id.into(),
+        message,
+        output: RunOutput::default(),
+    };
+    let Some(lease) = RunLease::try_acquire(path, &format!("run:{run_id}")).map_err(fail)? else {
+        return Ok(None);
+    };
+    // The scan is only a hint: another owner may have finished since it ran.
+    let current = journal.get_run(run_id).map_err(|e| fail(e.to_string()))?;
+    if !matches!(current.status.as_str(), "parked" | "running") {
+        return Ok(None);
+    }
+    if can_remain_parked(journal, run_id).map_err(fail)? {
+        // A crash may have left `running` after the wait was persisted.
+        if current.status == "running" {
+            Journal::open(path)
+                .map_err(|e| fail(e.to_string()))?
+                .set_status(run_id, "parked")
+                .map_err(|e| fail(e.to_string()))?;
+        }
+        return Ok(None);
+    }
+    let (graph, policy, session) = Session::resume_with_lease(path, run_id, lease).map_err(fail)?;
+    crate::host::replay_session(graph, policy, session, None)?;
+    journal
+        .get_run(run_id)
+        .map(Some)
+        .map_err(|e| fail(e.to_string()))
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn stale_candidates_are_checked_again_after_claiming_the_lease() {
+        let directory = std::env::temp_dir().join(format!("ondure-wake-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("journal.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        // Invalid snapshots deliberately prove terminal candidates are never replayed.
+        for status in ["done", "failed", "diverged"] {
+            journal
+                .create_run(status, None, "hash", "input", "{}")
+                .unwrap();
+            assert!(journal
+                .recoverable_runs()
+                .unwrap()
+                .iter()
+                .any(|run| run.id == status));
+            journal.finish_run(status, status, "saved", "").unwrap();
+            assert!(wake_run(&path, &journal, status).unwrap().is_none());
+            assert_eq!(journal.get_run(status).unwrap().status, status);
+        }
+        drop(journal);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn live_owners_are_skipped_without_batch_errors() {
+        let directory = std::env::temp_dir().join(format!("ondure-wake-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("journal.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        journal
+            .create_run("live", None, "hash", "input", "{}")
+            .unwrap();
+        let lease = RunLease::acquire(&path, "run:live").unwrap();
+        assert!(wake_ready(&path).unwrap().is_empty());
+        assert_eq!(journal.get_run("live").unwrap().status, "running");
+        drop((journal, lease));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

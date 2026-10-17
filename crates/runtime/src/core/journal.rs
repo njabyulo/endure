@@ -173,6 +173,15 @@ impl Journal {
         records.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub(crate) fn recoverable_runs(&self) -> Result<Vec<RunRecord>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, request_id, code_hash, input_digest, graph, status, stdout, stderr
+             FROM runs WHERE status IN ('parked', 'running') ORDER BY id",
+        )?;
+        let records = statement.query_map([], read_run)?;
+        records.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn set_status(&mut self, id: &str, status: &str) -> Result<(), JournalError> {
         let transaction = self
             .connection
