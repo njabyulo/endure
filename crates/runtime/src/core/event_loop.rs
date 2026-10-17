@@ -89,6 +89,9 @@ impl Operations {
         id: OperationId,
         session: Option<&mut super::durability::Session>,
     ) -> Result<(), String> {
+        if !self.timers.contains_key(&id) {
+            return Ok(());
+        }
         if let Some(session) = session {
             session.cancel(id)?;
         }

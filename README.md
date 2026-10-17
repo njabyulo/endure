@@ -130,8 +130,9 @@ connections, computed-property fetch denial, and successful JSON responses.
 ## Reading the code
 
 Start with `crates/runtime/src/host.rs` for execution flow. The CLI calls its
-`run_module` function through the public exports in `crates/runtime/src/lib.rs`,
-after preparing a `ModuleGraph`. `run_source` remains available for script embedding.
+`run_durable` function through the public exports in `crates/runtime/src/lib.rs`,
+after preparing a `ModuleGraph`. `run_module` and `run_source` remain available
+for execution without a journal.
 Inside the runtime, each group covers a different lesson:
 
 1. `core/embedding.rs`: V8 platform initialization, isolates, and host bindings.
@@ -174,9 +175,10 @@ Results commit before individual JS delivery; no fsync is deferred past an await
 ./build/ondure log example
 ```
 
-Run IDs are generated when omitted. Duplicate IDs fail rather than replacing a
-run. The Rust `run_durable` API provides the same boundary; `run_source` and
-`run_module` remain ephemeral embedding APIs. Captured code and the run's network
+Run IDs are generated when omitted and printed on stderr before execution.
+Duplicate IDs fail rather than replacing a run. The Rust `run_durable` API
+provides the same boundary; `run_source` and `run_module` remain ephemeral
+embedding APIs. Captured code and the run's network
 policy are stored with the run. Console output is captured again at finalization;
 it is not an external exactly-once effect.
 

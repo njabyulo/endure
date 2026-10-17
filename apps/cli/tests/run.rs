@@ -94,6 +94,16 @@ impl Drop for TestDirectory {
     }
 }
 
+// Successful preparation prints the generated run ID before captured script output.
+fn script_stderr(output: &std::process::Output) -> &str {
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    if stderr.starts_with("Run ID: ") {
+        stderr.split_once('\n').unwrap().1
+    } else {
+        stderr
+    }
+}
+
 // Keep test input independent of the example script used for experiments.
 fn fetch_source(url: &str) -> String {
     format!(
@@ -107,6 +117,35 @@ fn fetch_source(url: &str) -> String {
             }}
         }})();"#
     )
+}
+
+#[test]
+fn generated_run_ids_identify_successful_and_failed_journals() {
+    for source in ["console.log('hello');", "throw Error('boom');"] {
+        let directory = TestDirectory::new(None, source);
+        let output = directory.run(&["run", "agent.js"]);
+        let stderr = std::str::from_utf8(&output.stderr).unwrap();
+        let run_id = stderr
+            .strip_prefix("Run ID: ")
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap();
+        let journal = runtime::Journal::open(&directory.0.join(".ondure/journal.sqlite3")).unwrap();
+        let record = journal.get_run(run_id).unwrap();
+        assert_eq!(
+            record.status,
+            if output.status.success() {
+                "done"
+            } else {
+                "failed"
+            }
+        );
+        let log = directory.run(&["log", run_id]);
+        assert!(log.status.success());
+        assert_eq!(log.stdout, b"[]\n");
+        assert!(log.stderr.is_empty());
+    }
 }
 
 #[test]
@@ -137,7 +176,7 @@ fn allowed_policy_prints_witness_json_once() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "{\"hit\":1}\n");
-    assert!(output.stderr.is_empty());
+    assert!(script_stderr(&output).is_empty());
     assert_eq!(hits, 1);
 }
 
@@ -203,10 +242,7 @@ fn failed_scripts_print_prior_output_before_the_error() {
         let output = directory.run(&["run", "agent.js"]);
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(String::from_utf8_lossy(&output.stdout), "starting\n");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
-            format!("warning\n{diagnostic}")
-        );
+        assert_eq!(script_stderr(&output), format!("warning\n{diagnostic}"));
     }
 }
 
@@ -226,7 +262,7 @@ fn event_loop_finishes_timers_and_exits_when_idle() {
     let output = directory.run(&["run", "agent.js"]);
     assert!(output.status.success());
     assert_eq!(output.stdout, b"starting\nfinished\n");
-    assert!(output.stderr.is_empty());
+    assert!(script_stderr(&output).is_empty());
 }
 
 #[test]
@@ -238,7 +274,7 @@ fn failed_script_finishes_pending_timers_before_printing_error() {
     let output = directory.run(&["run", "agent.js"]);
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(output.stdout, b"finished\n");
-    assert_eq!(output.stderr, b"agent.js: Error: boom\n");
+    assert_eq!(script_stderr(&output), "agent.js: Error: boom\n");
 }
 
 #[test]
@@ -254,8 +290,8 @@ fn large_stdout_and_stderr_do_not_block_child_exit() {
         format!("{}\n", "x".repeat(1024 * 1024)).as_bytes()
     );
     assert_eq!(
-        output.stderr,
-        format!("{}\n", "y".repeat(1024 * 1024)).as_bytes()
+        script_stderr(&output),
+        format!("{}\n", "y".repeat(1024 * 1024))
     );
 }
 
@@ -287,7 +323,7 @@ fn typescript_entry_and_local_imports_run_without_a_build_step() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(output.stdout, b"42 undefined undefined\n");
-        assert!(output.stderr.is_empty());
+        assert!(script_stderr(&output).is_empty());
     }
 }
 

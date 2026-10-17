@@ -38,12 +38,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     let policy = Policy::load(Path::new("ondure.yaml"))?;
     let script = target;
     let graph = ModuleGraph::load(Path::new(&script))?;
-    let output = match run_durable(
-        &policy,
-        &graph,
-        &journal,
-        &run_id.unwrap_or_else(new_run_id),
-    ) {
+    let run_id = match run_id {
+        Some(run_id) => run_id,
+        None => {
+            let run_id = new_run_id();
+            writeln!(std::io::stderr().lock(), "Run ID: {run_id}")?;
+            run_id
+        }
+    };
+    let output = match run_durable(&policy, &graph, &journal, &run_id) {
         Ok(output) => output,
         Err(error) => {
             write_output(&error.output)?;

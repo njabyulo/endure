@@ -48,6 +48,30 @@ fn durable_fetch_and_timer_results_precede_successful_run() {
 }
 
 #[test]
+fn clearing_non_timer_ids_never_cancels_fetches_or_adds_journal_entries() {
+    let witness = Witness::new(200, r#"{"hit":1}"#);
+    let project = Project::new(&format!(
+        "const pending = fetch('{}'); clearTimeout(1); clearTimeout(999); console.log((await (await pending).json()).hit);",
+        witness.url()
+    ));
+    let output = run_durable(
+        &Policy { net: true },
+        &project.graph(),
+        &project.journal(),
+        "run",
+    )
+    .unwrap();
+    assert_eq!(output.stdout, "1\n");
+    assert_eq!(witness.finish(), 1);
+    let journal = Journal::open(&project.journal()).unwrap();
+    let ops = journal.operations("run").unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].name, "fetch.get");
+    assert_eq!(ops[0].state, "completed");
+    assert!(ops[0].result.as_ref().unwrap().contains("hit"));
+}
+
+#[test]
 fn failures_and_canceled_timers_are_persisted() {
     let project = Project::new("const id = setTimeout(() => console.log('wrong'), 10000); clearTimeout(id); console.log('starting'); throw Error('boom');");
     let error = run_durable(
