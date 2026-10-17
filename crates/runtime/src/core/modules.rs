@@ -27,14 +27,14 @@ impl std::error::Error for ModuleError {}
 
 /// An immutable snapshot of the reachable execution graph, including emitted JS.
 /// Explicit `import type` declarations are erased before graph traversal.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModuleGraph {
     pub(crate) filename: String,
     entry: String,
     modules: BTreeMap<String, PreparedModule>,
     hash: String,
 }
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct PreparedModule {
     source: String,
     javascript: String,
@@ -127,6 +127,24 @@ impl ModuleGraph {
                 .insert(specifier, target_id);
         }
         Ok(id)
+    }
+
+    pub(crate) fn verify_integrity(&self) -> Result<(), ModuleError> {
+        if !self.modules.contains_key(&self.entry)
+            || self.modules.values().any(|module| {
+                module
+                    .imports
+                    .values()
+                    .any(|id| !self.modules.contains_key(id))
+            })
+            || self.compute_hash() != self.hash
+        {
+            return Err(ModuleError::new(
+                &self.filename,
+                "module snapshot integrity check failed",
+            ));
+        }
+        Ok(())
     }
 
     fn compute_hash(&self) -> String {

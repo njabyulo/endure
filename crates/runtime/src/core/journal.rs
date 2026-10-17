@@ -1,0 +1,451 @@
+//! Durable run and operation records. Each mutation commits before returning.
+
+use std::{fmt, path::Path, time::Duration};
+
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug)]
+pub struct JournalError(String);
+
+impl fmt::Display for JournalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for JournalError {}
+
+impl From<rusqlite::Error> for JournalError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self(format!("journal: {error}"))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecord {
+    pub id: String,
+    pub request_id: Option<String>,
+    pub code_hash: String,
+    pub input_digest: String,
+    pub graph: String,
+    pub status: String,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpIntent {
+    pub seq: u64,
+    pub name: String,
+    pub args_digest: String,
+    pub policy: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpRecord {
+    pub seq: u64,
+    pub name: String,
+    pub args_digest: String,
+    pub policy: String,
+    pub state: String,
+    pub result: Option<String>,
+    pub completion_order: Option<u64>,
+}
+
+pub struct Journal {
+    connection: Connection,
+}
+
+impl Journal {
+    pub fn open(path: &Path) -> Result<Self, JournalError> {
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE IF NOT EXISTS runs (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 request_id TEXT UNIQUE,
+                 code_hash TEXT NOT NULL,
+                 input_digest TEXT NOT NULL,
+                 graph TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 stdout TEXT NOT NULL DEFAULT '',
+                 stderr TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE IF NOT EXISTS operations (
+                 run_id TEXT NOT NULL REFERENCES runs(id),
+                 seq INTEGER NOT NULL CHECK(seq >= 0),
+                 name TEXT NOT NULL,
+                 args_digest TEXT NOT NULL,
+                 policy TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN ('pending', 'completed')),
+                 result TEXT,
+                 completion_order INTEGER CHECK(completion_order >= 0),
+                 PRIMARY KEY(run_id, seq),
+                 UNIQUE(run_id, completion_order),
+                 CHECK((state = 'pending' AND result IS NULL AND completion_order IS NULL)
+                    OR (state = 'completed' AND result IS NOT NULL AND completion_order IS NOT NULL))
+             );
+             COMMIT;",
+        )?;
+        Ok(Self { connection })
+    }
+
+    pub fn create_run(
+        &mut self,
+        id: &str,
+        request_id: Option<&str>,
+        code_hash: &str,
+        input_digest: &str,
+        graph: &str,
+    ) -> Result<RunRecord, JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO runs (id, request_id, code_hash, input_digest, graph, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running')",
+            params![id, request_id, code_hash, input_digest, graph],
+        )?;
+        let record = transaction.query_row(
+            "SELECT id, request_id, code_hash, input_digest, graph, status, stdout, stderr
+             FROM runs WHERE id = ?1",
+            [id],
+            read_run,
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn get_run(&self, id: &str) -> Result<RunRecord, JournalError> {
+        self.connection
+            .query_row(
+                "SELECT id, request_id, code_hash, input_digest, graph, status, stdout, stderr
+                 FROM runs WHERE id = ?1",
+                [id],
+                read_run,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn find_request(&self, request_id: &str) -> Result<Option<RunRecord>, JournalError> {
+        self.connection
+            .query_row(
+                "SELECT id, request_id, code_hash, input_digest, graph, status, stdout, stderr
+                 FROM runs WHERE request_id = ?1",
+                [request_id],
+                read_run,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_status(&mut self, id: &str, status: &str) -> Result<(), JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_one(transaction.execute(
+            "UPDATE runs SET status = ?2 WHERE id = ?1",
+            params![id, status],
+        )?)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_run(
+        &mut self,
+        id: &str,
+        status: &str,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<(), JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_one(transaction.execute(
+            "UPDATE runs SET status = ?2, stdout = ?3, stderr = ?4 WHERE id = ?1",
+            params![id, status, stdout, stderr],
+        )?)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Commit all intents together, before any corresponding operation is dispatched.
+    pub fn intents(&mut self, run_id: &str, intents: &[OpIntent]) -> Result<(), JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for intent in intents {
+            let seq = sequence(intent.seq)?;
+            let existing = transaction
+                .query_row(
+                    "SELECT name, args_digest, policy FROM operations WHERE run_id = ?1 AND seq = ?2",
+                    params![run_id, seq],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                )
+                .optional()?;
+            if let Some((name, args_digest, policy)) = existing {
+                if name != intent.name
+                    || args_digest != intent.args_digest
+                    || policy != intent.policy
+                {
+                    return Err(JournalError(format!(
+                        "journal: intent mismatch at operation {}",
+                        intent.seq
+                    )));
+                }
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO operations (run_id, seq, name, args_digest, policy, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
+                params![run_id, seq, intent.name, intent.args_digest, intent.policy],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Store a result once; retries may repeat the exact same serialized result.
+    pub fn complete(&mut self, run_id: &str, seq: u64, result: &str) -> Result<(), JournalError> {
+        self.complete_batch(run_id, &[(seq, result.to_owned())])
+    }
+
+    /// Commit a completion batch in delivery order, with no partial writes on failure.
+    pub fn complete_batch(
+        &mut self,
+        run_id: &str,
+        results: &[(u64, String)],
+    ) -> Result<(), JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (seq, result) in results {
+            let seq = sequence(*seq)?;
+            let existing: Option<String> = transaction.query_row(
+                "SELECT result FROM operations WHERE run_id = ?1 AND seq = ?2",
+                params![run_id, seq],
+                |row| row.get(0),
+            )?;
+            if let Some(existing) = existing {
+                if existing != *result {
+                    return Err(JournalError(format!(
+                        "journal: result mismatch at operation {seq}"
+                    )));
+                }
+            } else {
+                transaction.execute(
+                    "UPDATE operations SET state = 'completed', result = ?3,
+                         completion_order = (SELECT COALESCE(MAX(completion_order), -1) + 1
+                                             FROM operations WHERE run_id = ?1)
+                     WHERE run_id = ?1 AND seq = ?2",
+                    params![run_id, seq, result],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn operations(&self, run_id: &str) -> Result<Vec<OpRecord>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT seq, name, args_digest, policy, state, result, completion_order
+             FROM operations WHERE run_id = ?1 ORDER BY seq",
+        )?;
+        let records = statement.query_map([run_id], |row| {
+            Ok(OpRecord {
+                seq: row.get(0)?,
+                name: row.get(1)?,
+                args_digest: row.get(2)?,
+                policy: row.get(3)?,
+                state: row.get(4)?,
+                result: row.get(5)?,
+                completion_order: row.get(6)?,
+            })
+        })?;
+        records.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+}
+
+fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
+    Ok(RunRecord {
+        id: row.get(0)?,
+        request_id: row.get(1)?,
+        code_hash: row.get(2)?,
+        input_digest: row.get(3)?,
+        graph: row.get(4)?,
+        status: row.get(5)?,
+        stdout: row.get(6)?,
+        stderr: row.get(7)?,
+    })
+}
+
+fn sequence(seq: u64) -> Result<i64, JournalError> {
+    i64::try_from(seq).map_err(|_| {
+        JournalError("journal: operation sequence exceeds SQLite integer range".into())
+    })
+}
+
+fn require_one(changed: usize) -> Result<(), JournalError> {
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(JournalError("journal: run not found".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ondure-journal-{}.sqlite", uuid::Uuid::new_v4()))
+    }
+
+    fn intent(seq: u64) -> OpIntent {
+        OpIntent {
+            seq,
+            name: "fetch".into(),
+            args_digest: format!("args-{seq}"),
+            policy: "net".into(),
+        }
+    }
+
+    fn create(journal: &mut Journal) {
+        journal
+            .create_run("run", Some("request"), "hash", "input", "graph")
+            .unwrap();
+    }
+
+    #[test]
+    fn records_survive_reopening_and_use_durable_pragmas() {
+        let path = temporary_path();
+        {
+            let mut journal = Journal::open(&path).unwrap();
+            create(&mut journal);
+            journal.intents("run", &[intent(0), intent(1)]).unwrap();
+            journal.complete("run", 1, "second").unwrap();
+            journal.complete("run", 0, "first").unwrap();
+            journal
+                .finish_run("run", "completed", "out", "err")
+                .unwrap();
+            assert_eq!(
+                journal
+                    .connection
+                    .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "wal"
+            );
+            assert_eq!(
+                journal
+                    .connection
+                    .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+        }
+        let journal = Journal::open(&path).unwrap();
+        let run = journal.get_run("run").unwrap();
+        assert_eq!(run.status, "completed");
+        assert_eq!((run.stdout.as_str(), run.stderr.as_str()), ("out", "err"));
+        assert_eq!(journal.find_request("request").unwrap(), Some(run));
+        assert_eq!(journal.find_request("absent").unwrap(), None);
+        let operations = journal.operations("run").unwrap();
+        assert_eq!(operations[0].completion_order, Some(1));
+        assert_eq!(operations[1].completion_order, Some(0));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn intent_batches_rollback_on_a_mismatch() {
+        let path = temporary_path();
+        let mut journal = Journal::open(&path).unwrap();
+        create(&mut journal);
+        journal.intents("run", &[intent(0)]).unwrap();
+        let mut changed = intent(0);
+        changed.args_digest = "different".into();
+        assert!(journal.intents("run", &[intent(1), changed]).is_err());
+        let operations = journal.operations("run").unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].state, "pending");
+        assert_eq!(operations[0].result, None);
+        assert!(journal.complete("run", 1, "no-intent").is_err());
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn completed_results_are_immutable_and_retries_do_not_reorder() {
+        let path = temporary_path();
+        let mut journal = Journal::open(&path).unwrap();
+        create(&mut journal);
+        journal.intents("run", &[intent(0), intent(1)]).unwrap();
+        journal.complete("run", 0, "original").unwrap();
+        journal.complete("run", 1, "next").unwrap();
+        journal.complete("run", 0, "original").unwrap();
+        journal.intents("run", &[intent(0)]).unwrap();
+        assert!(journal.complete("run", 0, "replacement").is_err());
+        let operations = journal.operations("run").unwrap();
+        assert_eq!(operations[0].result.as_deref(), Some("original"));
+        assert_eq!(operations[0].completion_order, Some(0));
+        assert_eq!(operations[1].completion_order, Some(1));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn result_batches_commit_together_in_delivery_order() {
+        let path = temporary_path();
+        let mut journal = Journal::open(&path).unwrap();
+        create(&mut journal);
+        journal
+            .intents("run", &[intent(0), intent(1), intent(2)])
+            .unwrap();
+        assert!(journal
+            .complete_batch("run", &[(1, "one".into()), (99, "missing".into())])
+            .is_err());
+        assert!(journal
+            .operations("run")
+            .unwrap()
+            .iter()
+            .all(|op| op.result.is_none()));
+        journal
+            .complete_batch(
+                "run",
+                &[(2, "two".into()), (0, "zero".into()), (1, "one".into())],
+            )
+            .unwrap();
+        let operations = journal.operations("run").unwrap();
+        assert_eq!(
+            operations
+                .iter()
+                .map(|op| op.completion_order)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(0)]
+        );
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn request_ids_are_unique_and_unknown_runs_cannot_be_updated() {
+        let path = temporary_path();
+        let mut journal = Journal::open(&path).unwrap();
+        create(&mut journal);
+        assert!(journal
+            .create_run("other", Some("request"), "hash", "input", "graph")
+            .is_err());
+        assert!(journal.get_run("other").is_err());
+        assert!(journal.set_status("missing", "completed").is_err());
+        assert!(journal.intents("missing", &[intent(0)]).is_err());
+        journal.set_status("run", "interrupted").unwrap();
+        assert_eq!(journal.get_run("run").unwrap().status, "interrupted");
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+}
