@@ -1,4 +1,4 @@
-use runtime::{replay_run, Journal, ModuleGraph, OpIntent};
+use runtime::{wake_ready, Journal, ModuleGraph, OpIntent};
 use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf};
 
@@ -55,10 +55,13 @@ fn crash_after_wait_registration_replays_until_a_confirmed_park_checkpoint() {
         journal
             .park_wait("interrupted", 0, "approval", None, &details)
             .unwrap();
+        assert_eq!(journal.get_run("interrupted").unwrap().status, "running");
     }
     fs::remove_file(source).unwrap();
 
-    let output = replay_run(&path, "interrupted", None).unwrap();
+    let mut outcomes = wake_ready(&path).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    let output = outcomes.remove(0).result.unwrap();
     assert_eq!(output.stdout, "after registration\n");
     assert!(output.stderr.is_empty());
     let journal = Journal::open(&path).unwrap();
@@ -68,5 +71,6 @@ fn crash_after_wait_registration_replays_until_a_confirmed_park_checkpoint() {
     assert_eq!(journal.waits("interrupted").unwrap().len(), 1);
     assert_eq!(journal.waits("interrupted").unwrap()[0].answer, None);
     assert_eq!(journal.operations("interrupted").unwrap().len(), 1);
-    assert_eq!(replay_run(&path, "interrupted", None).unwrap(), output);
+    assert!(wake_ready(&path).unwrap().is_empty());
+    assert_eq!(journal.get_run("interrupted").unwrap(), run);
 }

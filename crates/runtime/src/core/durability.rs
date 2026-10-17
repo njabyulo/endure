@@ -542,14 +542,7 @@ fn wake_run(
     if !matches!(current.status.as_str(), "parked" | "running") {
         return Ok(None);
     }
-    if can_remain_parked(journal, run_id).map_err(fail)? {
-        // A crash may have left `running` after the wait was persisted.
-        if current.status == "running" {
-            Journal::open(path)
-                .map_err(|e| fail(e.to_string()))?
-                .set_status(run_id, "parked")
-                .map_err(|e| fail(e.to_string()))?;
-        }
+    if current.status == "parked" && can_remain_parked(journal, run_id).map_err(fail)? {
         return Ok(None);
     }
     let (graph, policy, session) = Session::resume_with_lease(path, run_id, lease).map_err(fail)?;
