@@ -5,7 +5,7 @@
 //! compiled modules, pending resolvers, timer callbacks, and rejection reasons.
 
 use crate::{
-    core::{embedding, event_loop, execution, microtasks, modules},
+    core::{durability::Session, embedding, event_loop, execution, microtasks, modules},
     integrations::{io, networking, timers},
     Policy,
 };
@@ -16,6 +16,7 @@ pub(crate) struct HostState {
     pub(crate) stdout: RefCell<String>,
     pub(crate) stderr: RefCell<String>,
     pub(crate) operations: RefCell<event_loop::Operations>,
+    pub(crate) session: RefCell<Option<Session>>,
     pub(crate) rejections: microtasks::PromiseRejections,
 }
 
@@ -47,7 +48,7 @@ impl std::error::Error for HostError {}
 /// a separate thread to avoid nesting executors. Async callers should use
 /// `spawn_blocking` when they need their own executor to keep making progress.
 pub fn run_source(policy: &Policy, filename: &str, source: &str) -> Result<RunOutput, HostError> {
-    execute(policy, filename, Program::Script(source))
+    execute(policy, filename, Program::Script(source), None)
 }
 
 /// Execute a prepared graph, optionally requiring the code hash of a prior run.
@@ -58,6 +59,11 @@ pub fn run_module(
     graph: &modules::ModuleGraph,
     expected_hash: Option<&str>,
 ) -> Result<RunOutput, HostError> {
+    graph.verify_integrity().map_err(|error| HostError {
+        filename: error.filename,
+        message: error.message,
+        output: RunOutput::default(),
+    })?;
     if let Some(expected) = expected_hash {
         if expected != graph.code_hash() {
             return Err(HostError {
@@ -70,7 +76,32 @@ pub fn run_module(
             });
         }
     }
-    execute(policy, &graph.filename, Program::Module(graph))
+    execute(policy, &graph.filename, Program::Module(graph), None)
+}
+
+/// Execute a fresh journaled run. Operation results commit before JS observes them.
+pub fn run_durable(
+    policy: &Policy,
+    graph: &modules::ModuleGraph,
+    journal: &std::path::Path,
+    run_id: &str,
+) -> Result<RunOutput, HostError> {
+    graph.verify_integrity().map_err(|error| HostError {
+        filename: error.filename,
+        message: error.message,
+        output: RunOutput::default(),
+    })?;
+    let session = Session::create(journal, run_id, policy, graph).map_err(|message| HostError {
+        filename: graph.filename.clone(),
+        message,
+        output: RunOutput::default(),
+    })?;
+    execute(
+        policy,
+        &graph.filename,
+        Program::Module(graph),
+        Some(session),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -79,12 +110,19 @@ enum Program<'a> {
     Module(&'a modules::ModuleGraph),
 }
 
-fn execute(policy: &Policy, filename: &str, program: Program<'_>) -> Result<RunOutput, HostError> {
+fn execute(
+    policy: &Policy,
+    filename: &str,
+    program: Program<'_>,
+    session: Option<Session>,
+) -> Result<RunOutput, HostError> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return std::thread::scope(|threads| {
             let worker = std::thread::Builder::new()
                 .name("ondure-isolate".into())
-                .spawn_scoped(threads, || run_on_thread(policy, filename, program))
+                .spawn_scoped(threads, || {
+                    run_on_thread(policy, filename, program, session)
+                })
                 .map_err(|error| HostError {
                     filename: filename.into(),
                     message: format!("isolate thread initialization failed: {error}"),
@@ -99,7 +137,7 @@ fn execute(policy: &Policy, filename: &str, program: Program<'_>) -> Result<RunO
             })
         });
     }
-    run_on_thread(policy, filename, program)
+    run_on_thread(policy, filename, program, session)
 }
 
 // Create, execute, and dispose both V8 and Tokio on the same host thread.
@@ -107,6 +145,7 @@ fn run_on_thread(
     policy: &Policy,
     filename: &str,
     program: Program<'_>,
+    session: Option<Session>,
 ) -> Result<RunOutput, HostError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -124,6 +163,7 @@ fn run_on_thread(
         stdout: RefCell::new(String::new()),
         stderr: RefCell::new(String::new()),
         operations: RefCell::new(event_loop::Operations::default()),
+        session: RefCell::new(session),
         rejections: microtasks::PromiseRejections::default(),
     });
 
@@ -165,6 +205,13 @@ fn run_on_thread(
         stdout: state.stdout.take(),
         stderr: state.stderr.take(),
     };
+    let mut result = result;
+    if let Some(mut session) = state.session.into_inner() {
+        let status = if result.is_ok() { "done" } else { "failed" };
+        if let Err(error) = session.finish(status, &output) {
+            result = Err(error);
+        }
+    }
     match result {
         Ok(()) => Ok(output),
         Err(message) => Err(HostError {

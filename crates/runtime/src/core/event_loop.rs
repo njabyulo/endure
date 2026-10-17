@@ -40,10 +40,19 @@ impl Operations {
         }
     }
 
-    pub(crate) fn fetch(&mut self, url: String, resolver: v8::Global<v8::PromiseResolver>) {
+    pub(crate) fn fetch(
+        &mut self,
+        url: String,
+        resolver: v8::Global<v8::PromiseResolver>,
+        session: Option<&mut super::durability::Session>,
+    ) -> Result<(), String> {
         let id = self.id();
+        if let Some(session) = session {
+            session.register(id, "fetch.get", &serde_json::json!([url]), "safe")?;
+        }
         self.fetches.insert(id, resolver);
         self.queued.push((id, url));
+        Ok(())
     }
 
     pub(crate) fn timer(
@@ -51,8 +60,17 @@ impl Operations {
         delay: Duration,
         callback: v8::Global<v8::Function>,
         arguments: Vec<v8::Global<v8::Value>>,
-    ) -> OperationId {
+        session: Option<&mut super::durability::Session>,
+    ) -> Result<OperationId, String> {
         let id = self.id();
+        if let Some(session) = session {
+            session.register(
+                id,
+                "timer.sleep",
+                &serde_json::json!([delay.as_millis() as u64]),
+                "safe",
+            )?;
+        }
         let deadline = Instant::now() + delay;
         self.deadlines.insert((deadline, id));
         self.timers.insert(
@@ -63,11 +81,22 @@ impl Operations {
                 arguments,
             },
         );
-        id
+        Ok(id)
     }
 
-    pub(crate) fn cancel_timer(&mut self, id: OperationId) {
+    pub(crate) fn cancel_timer(
+        &mut self,
+        id: OperationId,
+        session: Option<&mut super::durability::Session>,
+    ) -> Result<(), String> {
+        if !self.timers.contains_key(&id) {
+            return Ok(());
+        }
+        if let Some(session) = session {
+            session.cancel(id)?;
+        }
         self.remove_timer(id);
+        Ok(())
     }
 
     fn remove_timer(&mut self, id: OperationId) -> Option<Timer> {
@@ -141,6 +170,15 @@ pub(crate) fn run(
             // Rendering a user-thrown value can enqueue more microtasks.
             continue;
         }
+        if let Some(session) = scope
+            .get_slot::<HostState>()
+            .expect("host state installed")
+            .session
+            .borrow_mut()
+            .as_mut()
+        {
+            session.flush()?;
+        }
         // Release the isolate-slot borrow before any JavaScript can run.
         let (queued, timer) = {
             let state = scope.get_slot::<HostState>().expect("host state installed");
@@ -186,6 +224,18 @@ pub(crate) fn run(
         v8::tc_scope!(let scope, scope);
         match completion {
             Completion::Http((id, result)) => {
+                if let Some(session) = scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .session
+                    .borrow_mut()
+                    .as_mut()
+                {
+                    session.complete(
+                        id,
+                        &serde_json::to_value(&result).map_err(|e| e.to_string())?,
+                    )?;
+                }
                 let retained = scope
                     .get_slot::<HostState>()
                     .expect("host state installed")
@@ -198,6 +248,15 @@ pub(crate) fn run(
                 networking::complete(scope, resolver, result);
             }
             Completion::Timer(id) => {
+                if let Some(session) = scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .session
+                    .borrow_mut()
+                    .as_mut()
+                {
+                    session.complete(id, &serde_json::json!({"fired": true}))?;
+                }
                 let timer = scope
                     .get_slot::<HostState>()
                     .expect("host state installed")

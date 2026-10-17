@@ -35,12 +35,19 @@ fn fetch(
         return;
     };
     let retained = v8::Global::new(scope, resolver);
-    scope
-        .get_slot::<HostState>()
-        .expect("host state installed")
-        .operations
-        .borrow_mut()
-        .fetch(url, retained);
+    let result = {
+        let state = scope.get_slot::<HostState>().expect("host state installed");
+        let mut session = state.session.borrow_mut();
+        let result = state
+            .operations
+            .borrow_mut()
+            .fetch(url, retained, session.as_mut());
+        result
+    };
+    if let Err(error) = result {
+        throw_error(scope, &error);
+        return;
+    }
     return_value.set(resolver.get_promise(scope).into());
 }
 

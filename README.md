@@ -60,9 +60,9 @@ hash before creating the isolate or executing code. Use `None` for a fresh run.
 Both paths execute captured code without rereading files, even if the original
 files change or disappear. Loading is not an atomic filesystem snapshot.
 
-Graph hashes and source snapshots are not persisted by the CLI. Journaling and
-replay will supply persistent run identity in later milestones; C3 provides the
-snapshot and verification API. It does not implement replay or pin engine versions.
+The CLI persists graph snapshots and hashes with journaled runs. In-memory
+`run_module` remains available without journaling. Replay is a later milestone;
+code identity does not pin engine versions.
 All compilation and hashing dependencies belong to the runtime crate.
 
 ## Permissions
@@ -107,7 +107,7 @@ If a script or timer callback throws, submitted work still completes before the
 first uncaught error is reported. Unhandled promise rejections are checked at
 idle. Output from the entire run is retained on failure. Infinite JavaScript or
 endlessly scheduled work can still prevent exit; CPU limits and cancellation of
-HTTP requests are not implemented. Journaling and replay are also not implemented.
+HTTP requests are not implemented. Replay is not implemented in this layer.
 
 For Rust embedding, `run_source` and `run_module` are synchronous and block until idle.
 `run_source` retains classic JavaScript script semantics and requires an async
@@ -130,8 +130,9 @@ connections, computed-property fetch denial, and successful JSON responses.
 ## Reading the code
 
 Start with `crates/runtime/src/host.rs` for execution flow. The CLI calls its
-`run_module` function through the public exports in `crates/runtime/src/lib.rs`,
-after preparing a `ModuleGraph`. `run_source` remains available for script embedding.
+`run_durable` function through the public exports in `crates/runtime/src/lib.rs`,
+after preparing a `ModuleGraph`. `run_module` and `run_source` remain available
+for execution without a journal.
 Inside the runtime, each group covers a different lesson:
 
 1. `core/embedding.rs`: V8 platform initialization, isolates, and host bindings.
@@ -159,3 +160,31 @@ Unit tests live beside their lesson and exercise the public runtime API. For
 example, `cargo test -p runtime core::microtasks` demonstrates promise handling.
 `cargo test -p runtime --test network` exercises the networking integration with
 real local listeners.
+
+## Durable operation journal
+
+`ondure run` writes `.ondure/journal.sqlite3` by default. SQLite uses WAL and
+`synchronous=FULL`. Fetch and timer intents commit before dispatch; their results
+commit before promises settle or callbacks run. Cancellation and both success
+and failure results are recorded with a completion order. Intent batches flush
+at dispatch and at 256 entries or a 2 ms batching threshold during registration.
+Results commit before individual JS delivery; no fsync is deferred past an await.
+
+```sh
+./build/ondure run examples/typescript/agent.ts --run-id example --journal .ondure/journal.sqlite3
+./build/ondure log example
+```
+
+Run IDs are generated when omitted and printed on stderr before execution.
+Duplicate IDs fail rather than replacing a run. The Rust `run_durable` API
+provides the same boundary; `run_source` and `run_module` remain ephemeral
+embedding APIs. Captured code and the run's network
+policy are stored with the run. Console output is captured again at finalization;
+it is not an external exactly-once effect.
+
+A killed process can leave an intent without a result. This layer records that
+ambiguity and does not yet resume it. A committed result survives process death;
+power-loss durability additionally depends on the filesystem and storage device
+honoring SQLite's synchronization requests. The crash regression kills 100
+processes after an external witness sees a JS await continuation and verifies
+that every acknowledged result remains in the journal.

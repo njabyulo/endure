@@ -34,12 +34,24 @@ fn set_timeout(
     let arguments = (2..args.length())
         .map(|index| v8::Global::new(scope, args.get(index)))
         .collect();
-    let id = scope
-        .get_slot::<HostState>()
-        .expect("host state installed")
-        .operations
-        .borrow_mut()
-        .timer(Duration::from_millis(delay as u64), callback, arguments);
+    let result = {
+        let state = scope.get_slot::<HostState>().expect("host state installed");
+        let mut session = state.session.borrow_mut();
+        let result = state.operations.borrow_mut().timer(
+            Duration::from_millis(delay as u64),
+            callback,
+            arguments,
+            session.as_mut(),
+        );
+        result
+    };
+    let id = match result {
+        Ok(id) => id,
+        Err(error) => {
+            throw_error(scope, &error);
+            return;
+        }
+    };
     rv.set(v8::Integer::new_from_unsigned(scope, id).into());
 }
 
@@ -52,11 +64,23 @@ fn clear_timeout(
         return;
     };
     if id.is_finite() && id >= 1.0 && id <= u32::MAX as f64 && id.fract() == 0.0 {
-        scope
-            .get_slot::<HostState>()
-            .expect("host state installed")
-            .operations
-            .borrow_mut()
-            .cancel_timer(id as u32);
+        let result = {
+            let state = scope.get_slot::<HostState>().expect("host state installed");
+            let mut session = state.session.borrow_mut();
+            let result = state
+                .operations
+                .borrow_mut()
+                .cancel_timer(id as u32, session.as_mut());
+            result
+        };
+        if let Err(error) = result {
+            throw_error(scope, &error);
+        }
     }
+}
+
+fn throw_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    let message = v8::String::new(scope, message).expect("journal error");
+    let error = v8::Exception::error(scope, message);
+    scope.throw_exception(error);
 }
