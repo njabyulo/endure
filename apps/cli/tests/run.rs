@@ -129,3 +129,28 @@ fn usage_missing_script_and_host_errors_exit_one() {
         assert!(!output.stderr.is_empty());
     }
 }
+
+#[test]
+fn failed_scripts_print_prior_output_before_the_error() {
+    for (failure, diagnostic) in [
+        ("throw Error('boom');", "agent.js: Error: boom\n"),
+        (
+            "(async () => { await Promise.resolve(); throw Error('boom'); })();",
+            "agent.js: unhandled promise rejection: Error: boom\n",
+        ),
+        (
+            "Promise.reject(Error('boom')); 42;",
+            "agent.js: unhandled promise rejection: Error: boom\n",
+        ),
+    ] {
+        let source = format!("console.log('starting'); console.error('warning'); {failure}");
+        let directory = TestDirectory::new(None, &source);
+        let output = directory.run(&["run", "agent.js"]);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "starting\n");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("warning\n{diagnostic}")
+        );
+    }
+}

@@ -12,6 +12,6 @@
 // })();
 
 
-console.table({
+console.log(JSON.stringify({
   a: 'a'
-})
+}));

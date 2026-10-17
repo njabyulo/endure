@@ -36,10 +36,17 @@ fn fetch(
         return;
     };
     let url = url.to_rust_string_lossy(scope);
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        return;
+    };
     let (status, body) = match http_get(&url) {
         Ok(response) => response,
         Err(error) => {
-            throw_error(scope, &format!("fetch failed: {error}"));
+            let message = v8::String::new(scope, &format!("fetch failed: {error}"))
+                .expect("fetch error message");
+            let exception = v8::Exception::error(scope, message);
+            resolver.reject(scope, exception);
+            return_value.set(resolver.get_promise(scope).into());
             return;
         }
     };
@@ -61,9 +68,6 @@ fn fetch(
     set_property(scope, response, "status", status.into());
     set_property(scope, response, "json", json.into());
     set_property(scope, response, "_body", body.into());
-    let Some(resolver) = v8::PromiseResolver::new(scope) else {
-        return;
-    };
     if resolver.resolve(scope, response.into()).is_some() {
         return_value.set(resolver.get_promise(scope).into());
     }

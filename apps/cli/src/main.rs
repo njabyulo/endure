@@ -1,4 +1,4 @@
-use runtime::{run_source, Policy};
+use runtime::{run_source, Policy, RunOutput};
 use std::{error::Error, fs, io::Write, path::Path, process::ExitCode};
 
 fn run() -> Result<(), Box<dyn Error>> {
@@ -14,7 +14,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     let policy = Policy::load(Path::new("ondure.yaml"))?;
     let script = script.expect("script argument checked");
     let source = fs::read_to_string(&script)?;
-    let output = run_source(&policy, &script.to_string_lossy(), &source)?;
+    let output = match run_source(&policy, &script.to_string_lossy(), &source) {
+        Ok(output) => output,
+        Err(error) => {
+            write_output(&error.output)?;
+            return Err(error.into());
+        }
+    };
+    write_output(&output)?;
+    Ok(())
+}
+
+fn write_output(output: &RunOutput) -> std::io::Result<()> {
     std::io::stdout()
         .lock()
         .write_all(output.stdout.as_bytes())?;

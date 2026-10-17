@@ -28,6 +28,8 @@ pub struct RunOutput {
 pub struct HostError {
     pub filename: String,
     pub message: String,
+    /// Console output captured before the failure.
+    pub output: RunOutput,
 }
 
 impl fmt::Display for HostError {
@@ -48,7 +50,7 @@ pub fn run_source(policy: &Policy, filename: &str, source: &str) -> Result<RunOu
         rejections: microtasks::PromiseRejections::default(),
     });
 
-    {
+    let result = (|| -> Result<(), String> {
         v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -57,38 +59,37 @@ pub fn run_source(policy: &Policy, filename: &str, source: &str) -> Result<RunOu
 
         v8::tc_scope!(let scope, scope);
         execution::compile_and_run(scope, filename, source).map_err(|fallback| {
-            let message = scope
+            scope
                 .exception()
                 .map(|error| error.to_rust_string_lossy(scope))
-                .unwrap_or(fallback);
-            HostError {
-                filename: filename.into(),
-                message,
-            }
+                .unwrap_or(fallback)
         })?;
 
         microtasks::drain(scope);
         if let Some(exception) = scope.exception() {
-            return Err(HostError {
-                filename: filename.into(),
-                message: exception.to_rust_string_lossy(scope),
-            });
+            return Err(exception.to_rust_string_lossy(scope));
         }
         if let Some(message) = microtasks::take_unhandled_rejection(scope) {
-            return Err(HostError {
-                filename: filename.into(),
-                message,
-            });
+            return Err(message);
         }
-    }
+        Ok(())
+    })();
 
     let state = isolate
         .remove_slot::<HostState>()
         .expect("host state installed");
-    Ok(RunOutput {
+    let output = RunOutput {
         stdout: state.stdout.take(),
         stderr: state.stderr.take(),
-    })
+    };
+    match result {
+        Ok(()) => Ok(output),
+        Err(message) => Err(HostError {
+            filename: filename.into(),
+            message,
+            output,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -104,5 +105,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.stderr, "Error: caught\n");
+    }
+
+    #[test]
+    fn errors_retain_both_output_streams() {
+        for failure in [
+            "throw Error('boom');",
+            "(async () => { await Promise.resolve(); throw Error('boom'); })();",
+            "Promise.reject(Error('boom')); 42;",
+        ] {
+            let source = format!("console.log('starting'); console.error('warning'); {failure}");
+            let error = run_source(&Policy::default(), "failure.js", &source).unwrap_err();
+            assert_eq!(error.output.stdout, "starting\n");
+            assert_eq!(error.output.stderr, "warning\n");
+            assert!(error.message.contains("boom"));
+        }
+    }
+
+    #[test]
+    fn syntax_errors_have_no_output() {
+        let error = run_source(
+            &Policy::default(),
+            "syntax.js",
+            "console.log('not executed'); const = ;",
+        )
+        .unwrap_err();
+        assert_eq!(error.output, RunOutput::default());
+        assert!(error.message.contains("SyntaxError"));
     }
 }

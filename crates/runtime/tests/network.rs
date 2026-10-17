@@ -133,3 +133,121 @@ fn response_creation_ignores_prototype_setters() {
     assert_eq!(result.unwrap().stdout, "true 1\n");
     assert_eq!(hits, 1);
 }
+
+#[test]
+fn transport_failure_returns_promise_and_runs_catch_handler() {
+    let output = run_source(
+        &Policy { net: true },
+        "catch.js",
+        "const pending = fetch('http://127.0.0.1:0/hit'); console.log(pending instanceof Promise); pending.catch(e => console.error(e)); console.log('continuing');",
+    ).unwrap();
+    assert_eq!(output.stdout, "true\ncontinuing\n");
+    assert!(output.stderr.contains("fetch failed:"));
+}
+
+#[test]
+fn unhandled_transport_failure_is_a_promise_rejection() {
+    let error = run_source(
+        &Policy { net: true },
+        "unhandled-fetch.js",
+        "fetch('http://127.0.0.1:0/hit'); console.log('continuing');",
+    )
+    .unwrap_err();
+    assert!(error
+        .message
+        .starts_with("unhandled promise rejection: Error: fetch failed:"));
+    assert_eq!(error.output.stdout, "continuing\n");
+}
+
+#[test]
+fn permission_denial_stays_synchronous() {
+    let output = run_source(
+        &Policy::default(),
+        "sync-denial.js",
+        "try { fetch('http://127.0.0.1:0/hit').catch(() => console.log('wrong-handler')); } catch(e) { console.error(e); } console.log('continuing');",
+    ).unwrap();
+    assert_eq!(output.stdout, "continuing\n");
+    assert_eq!(output.stderr, "Error: permission denied: net\n");
+}
+
+#[test]
+fn witness_waits_for_complete_request_headers() {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    let witness = Witness::new(200, r#"{"hit":1}"#);
+    let address = witness
+        .url()
+        .trim_start_matches("http://")
+        .trim_end_matches("/hit")
+        .to_owned();
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    stream
+        .write_all(b"GET /hit HTTP/1.1\r\nHost: localhost\r\n")
+        .unwrap();
+    let mut byte = [0];
+    let error = stream
+        .read(&mut byte)
+        .expect_err("responded before headers were complete");
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(b"\r\n").unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.ends_with(r#"{"hit":1}"#));
+    assert_eq!(witness.finish(), 1);
+}
+
+#[test]
+fn response_body_read_failure_reaches_catch_handler() {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/hit", listener.local_addr().unwrap());
+    let worker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "client never connected");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+            let size = stream.read(&mut buffer).unwrap();
+            assert_ne!(size, 0, "client closed before sending headers");
+            request.extend_from_slice(&buffer[..size]);
+        }
+        // Advertise more bytes than supplied, then close the connection.
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nshort")
+            .unwrap();
+    });
+    let source = format!(
+        "const pending = fetch('{url}'); console.log(pending instanceof Promise); pending.catch(e => console.error(e)); console.log('continuing');"
+    );
+    let result = run_source(&Policy { net: true }, "truncated.js", &source);
+    worker.join().unwrap();
+    let output = result.unwrap();
+    assert_eq!(output.stdout, "true\ncontinuing\n");
+    assert!(output.stderr.contains("fetch failed:"));
+}
