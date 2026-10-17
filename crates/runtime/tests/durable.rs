@@ -146,8 +146,65 @@ fn replay_checks_code_and_detects_divergent_operation_arguments() {
             .get_run("run")
             .unwrap()
             .status,
-        "diverged"
+        "done"
     );
+}
+
+#[test]
+fn divergent_replays_keep_terminal_status_output_and_history_sealed() {
+    let project =
+        Project::new("console.log('original'); setTimeout(() => {}, 0); setTimeout(() => {}, 0);");
+    run_durable(
+        &Policy::default(),
+        &project.graph(),
+        &project.journal(),
+        "run",
+    )
+    .unwrap();
+    // An inconsistent recorded prefix must never become an extensible run after
+    // replay fails. This deterministically exercises an unexpected extra op.
+    rusqlite::Connection::open(project.journal())
+        .unwrap()
+        .execute(
+            "DELETE FROM operations WHERE run_id = 'run' AND seq = 1",
+            [],
+        )
+        .unwrap();
+    let journal = Journal::open(&project.journal()).unwrap();
+    let original = journal.get_run("run").unwrap();
+    let history = journal.operations("run").unwrap();
+    for _ in 0..2 {
+        let error = runtime::replay_run(&project.journal(), "run", None).unwrap_err();
+        assert!(
+            error.message.contains("unexpected operation"),
+            "{}",
+            error.message
+        );
+        assert_eq!(journal.get_run("run").unwrap(), original);
+        assert_eq!(journal.operations("run").unwrap(), history);
+    }
+}
+
+#[test]
+fn rejection_stringification_registers_its_operations_before_replay_delivery() {
+    let project = Project::new(
+        "Promise.reject({toString() { setTimeout(() => console.log('done'), 0); return 'bad'; }});",
+    );
+    let first = run_durable(
+        &Policy::default(),
+        &project.graph(),
+        &project.journal(),
+        "run",
+    )
+    .unwrap_err();
+    assert_eq!(first.message, "unhandled promise rejection: bad");
+    assert_eq!(first.output.stdout, "done\n");
+    let journal = Journal::open(&project.journal()).unwrap();
+    let original = journal.get_run("run").unwrap();
+    let replayed = runtime::replay_run(&project.journal(), "run", None).unwrap_err();
+    assert_eq!(replayed.message, first.message);
+    assert_eq!(replayed.output, first.output);
+    assert_eq!(journal.get_run("run").unwrap(), original);
 }
 
 #[test]

@@ -106,7 +106,9 @@ impl Drop for Process {
 struct Server {
     address: String,
     second_started: Receiver<()>,
+    retry_started: Receiver<()>,
     release: Option<Sender<()>>,
+    release_retry: Option<Sender<()>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<(usize, usize)>>,
 }
@@ -118,6 +120,8 @@ impl Server {
         let address = listener.local_addr().unwrap().to_string();
         let (started_tx, second_started) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
+        let (retry_tx, retry_started) = mpsc::channel();
+        let (release_retry, retry_rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let worker = thread::spawn(move || {
@@ -154,6 +158,8 @@ impl Server {
                             let _ = release_rx.recv_timeout(DEADLINE);
                             // Deliberately lose the response at the crash point.
                         } else {
+                            let _ = retry_tx.send(());
+                            let _ = retry_rx.recv_timeout(DEADLINE);
                             respond(&mut stream, r#"{"second":2}"#);
                         }
                     }
@@ -165,7 +171,9 @@ impl Server {
         Self {
             address,
             second_started,
+            retry_started,
             release: Some(release),
+            release_retry: Some(release_retry),
             stop,
             worker: Some(worker),
         }
@@ -185,6 +193,9 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(release) = self.release_retry.take() {
             let _ = release.send(());
         }
         if let Some(worker) = self.worker.take() {
@@ -245,6 +256,21 @@ fn sigkill_then_replay_reuses_completed_get_and_retries_unfinished_get() {
         .second_started
         .recv_timeout(DEADLINE)
         .expect("second request did not begin before deadline");
+    for args in [
+        vec!["replay", "crash-run", "--journal", "journal.sqlite3"],
+        vec![
+            "run",
+            "agent.js",
+            "--run-id",
+            "crash-run",
+            "--journal",
+            "journal.sqlite3",
+        ],
+    ] {
+        let blocked = Process::spawn(&directory.0, &args).finish();
+        assert!(!blocked.status.success());
+        assert!(String::from_utf8_lossy(&blocked.stderr).contains("already running"));
+    }
     original.child.kill().unwrap(); // Child::kill sends SIGKILL on Unix.
     let killed = original.finish();
     assert_eq!(killed.status.signal(), Some(9));
@@ -253,11 +279,23 @@ fn sigkill_then_replay_reuses_completed_get_and_retries_unfinished_get() {
     // Replay must use the stored graph and policy, not mutable disk inputs.
     fs::remove_file(directory.0.join("agent.js")).unwrap();
     fs::remove_file(directory.0.join("ondure.yaml")).unwrap();
-    let replay = Process::spawn(
+    let mut replay = Process::spawn(
+        &directory.0,
+        &["replay", "crash-run", "--journal", "journal.sqlite3"],
+    );
+    server
+        .retry_started
+        .recv_timeout(DEADLINE)
+        .expect("replay did not retry unfinished request");
+    let blocked = Process::spawn(
         &directory.0,
         &["replay", "crash-run", "--journal", "journal.sqlite3"],
     )
     .finish();
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("already running"));
+    server.release_retry.take().unwrap().send(()).unwrap();
+    let replay = replay.finish();
     assert!(
         replay.status.success(),
         "{}",

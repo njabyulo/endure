@@ -261,6 +261,9 @@ pub(crate) fn run(
                 continue;
             }
             let state = scope.get_slot::<HostState>().expect("host state installed");
+            if let Some(session) = state.session.borrow_mut().as_mut() {
+                session.check_idle()?;
+            }
             let ops = state.operations.borrow();
             if ops.queued.is_empty() && ops.timers.is_empty() {
                 drop(ops);

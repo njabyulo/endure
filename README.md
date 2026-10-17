@@ -201,6 +201,10 @@ order, supplying recorded results without opening sockets or repeating timer
 waits. After the recorded prefix it may continue an unfinished run. Completed
 runs reject unexpected extra operations. A changed graph passed through the Rust
 `replay_run` verification API fails its code-hash check before execution.
+Replaying a completed or failed run preserves its original status, output, and
+operation history, including when replay diverges. An operating-system lease
+allows only one process to execute a given run at a time and is released on
+process exit, including a crash.
 
 An intent without a result is ambiguous: a safe GET can be repeated. This is not
 an exactly-once guarantee for outside effects; unsafe tools are not exposed by

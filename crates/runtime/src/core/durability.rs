@@ -3,6 +3,7 @@
 use super::{
     journal::{Journal, OpIntent, OpRecord},
     modules::ModuleGraph,
+    parking::RunLease,
 };
 use crate::{Policy, RunOutput};
 use serde_json::Value;
@@ -18,6 +19,7 @@ pub(crate) fn digest(value: &Value) -> String {
 }
 
 pub(crate) struct Session {
+    _lease: RunLease,
     pub(crate) journal: Journal,
     pub(crate) run_id: String,
     next_seq: u64,
@@ -41,6 +43,7 @@ impl Session {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let mut journal = Journal::open(path).map_err(|e| e.to_string())?;
+        let lease = RunLease::acquire(path, &format!("run:{id}"))?;
         let snapshot = serde_json::json!({"graph": graph, "net": policy.net});
         let input = serde_json::json!({"net": policy.net});
         journal
@@ -53,6 +56,7 @@ impl Session {
             )
             .map_err(|e| e.to_string())?;
         Ok(Self {
+            _lease: lease,
             journal,
             run_id: id.into(),
             next_seq: 0,
@@ -68,6 +72,7 @@ impl Session {
 
     pub(crate) fn resume(path: &Path, id: &str) -> Result<(ModuleGraph, Policy, Self), String> {
         let journal = Journal::open(path).map_err(|e| e.to_string())?;
+        let lease = RunLease::acquire(path, &format!("run:{id}"))?;
         let record = journal.get_run(id).map_err(|e| e.to_string())?;
         let snapshot: Value = serde_json::from_str(&record.graph).map_err(|e| e.to_string())?;
         let graph: ModuleGraph =
@@ -87,6 +92,7 @@ impl Session {
         }
         let history = operations.into_iter().map(|op| (op.seq, op)).collect();
         let session = Self {
+            _lease: lease,
             journal,
             run_id: id.into(),
             next_seq: 0,
@@ -105,6 +111,17 @@ impl Session {
         let message = format!("replay divergence: {}", message.into());
         self.failure = Some(message.clone());
         Err(message)
+    }
+
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
+    pub(crate) fn check_idle(&mut self) -> Result<(), String> {
+        if self.has_history() {
+            return self.diverge("execution is idle before recorded completion was registered");
+        }
+        Ok(())
     }
 
     pub(crate) fn has_history(&self) -> bool {
@@ -153,7 +170,9 @@ impl Session {
             .find(|(_, pending)| **pending == seq)
             .map(|(&id, _)| id);
         let Some(id) = id else {
-            return self.diverge(format!("completion for operation {seq} is not registered"));
+            // Idle rejection rendering can run JS that registers this operation.
+            // The event loop validates remaining history after that final step.
+            return Ok(None);
         };
         Ok(Some((
             id,
@@ -277,6 +296,11 @@ impl Session {
         if status == "done" && (self.next_seq < self.history.len() as u64 || self.has_history()) {
             self.failure =
                 Some("replay divergence: execution ended before recorded history".into());
+        }
+        if self.sealed {
+            // Replays cannot replace the original terminal status or output,
+            // even if this replay diverges or is killed before finishing.
+            return self.failure.clone().map_or(Ok(()), Err);
         }
         if let Some(error) = self.failure.clone() {
             self.journal

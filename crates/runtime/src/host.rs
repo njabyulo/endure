@@ -130,14 +130,16 @@ pub fn replay_run(
             output: RunOutput::default(),
         });
     }
-    session
-        .journal
-        .set_status(run_id, "running")
-        .map_err(|error| HostError {
-            filename: run_id.into(),
-            message: error.to_string(),
-            output: RunOutput::default(),
-        })?;
+    if !session.is_sealed() {
+        session
+            .journal
+            .set_status(run_id, "running")
+            .map_err(|error| HostError {
+                filename: run_id.into(),
+                message: error.to_string(),
+                output: RunOutput::default(),
+            })?;
+    }
     execute(
         &policy,
         &graph.filename,
