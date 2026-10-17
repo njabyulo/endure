@@ -8,9 +8,6 @@
 use crate::host::HostState;
 use std::cell::RefCell;
 
-// Preserve the spike's explicit drain policy; this is not a general event loop.
-const MICROTASK_CHECKPOINTS: usize = 8;
-
 #[derive(Default)]
 pub(crate) struct PromiseRejections {
     pending: RefCell<Vec<PendingRejection>>,
@@ -27,9 +24,7 @@ pub(crate) fn install(isolate: &mut v8::Isolate) {
 }
 
 pub(crate) fn drain(scope: &mut v8::PinScope<'_, '_>) {
-    for _ in 0..MICROTASK_CHECKPOINTS {
-        scope.perform_microtask_checkpoint();
-    }
+    scope.perform_microtask_checkpoint();
 }
 
 pub(crate) fn take_unhandled_rejection(scope: &mut v8::PinScope<'_, '_>) -> Option<String> {

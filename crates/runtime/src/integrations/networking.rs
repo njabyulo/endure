@@ -1,15 +1,10 @@
-//! Network integration: JavaScript fetch, blocking HTTP, and response promises.
-//!
-//! Permission enforcement stays inside the native callback, before URL
-//! conversion or HTTP work. Returning a Promise does not make the HTTP call
-//! asynchronous; microtasks resume JavaScript after the callback returns.
-//! The network integration tests use real listeners to prove denial precedes
-//! sockets and allowed responses complete both await continuations.
+//! GET-only fetch: authorize, register work, and build responses on completion.
+//! HTTP runs on Tokio's blocking pool; V8 handles stay on the host thread.
 
 use crate::{core::embedding::set_property, host::HostState};
 use std::time::Duration;
 
-// Bound blocking HTTP work on the callback thread.
+// Bound each HTTP operation, including its response body read.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>) {
@@ -39,19 +34,30 @@ fn fetch(
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         return;
     };
-    let (status, body) = match http_get(&url) {
+    let retained = v8::Global::new(scope, resolver);
+    scope
+        .get_slot::<HostState>()
+        .expect("host state installed")
+        .operations
+        .borrow_mut()
+        .fetch(url, retained);
+    return_value.set(resolver.get_promise(scope).into());
+}
+
+pub(crate) fn complete(
+    scope: &mut v8::PinScope<'_, '_>,
+    resolver: v8::Local<v8::PromiseResolver>,
+    result: Result<(u16, String), String>,
+) {
+    let (status, body) = match result {
         Ok(response) => response,
         Err(error) => {
-            let message = v8::String::new(scope, &format!("fetch failed: {error}"))
-                .expect("fetch error message");
-            let exception = v8::Exception::error(scope, message);
-            resolver.reject(scope, exception);
-            return_value.set(resolver.get_promise(scope).into());
+            reject(scope, resolver, &format!("fetch failed: {error}"));
             return;
         }
     };
     let Some(body) = v8::String::new(scope, &body) else {
-        throw_error(scope, "response exceeds V8 string limit");
+        reject(scope, resolver, "response exceeds V8 string limit");
         return;
     };
     let response = v8::Object::new(scope);
@@ -68,18 +74,19 @@ fn fetch(
     set_property(scope, response, "status", status.into());
     set_property(scope, response, "json", json.into());
     set_property(scope, response, "_body", body.into());
-    if resolver.resolve(scope, response.into()).is_some() {
-        return_value.set(resolver.get_promise(scope).into());
-    }
+    resolver.resolve(scope, response.into());
 }
 
-fn http_get(url: &str) -> Result<(u16, String), Box<dyn std::error::Error>> {
+pub(crate) fn http_get(url: &str) -> Result<(u16, String), String> {
     let response = match ureq::get(url).timeout(HTTP_TIMEOUT).call() {
         Ok(response) | Err(ureq::Error::Status(_, response)) => response,
-        Err(error) => return Err(Box::new(error)),
+        Err(error) => return Err(error.to_string()),
     };
     let status = response.status();
-    Ok((status, response.into_string()?))
+    Ok((
+        status,
+        response.into_string().map_err(|error| error.to_string())?,
+    ))
 }
 
 fn response_json(
@@ -111,4 +118,14 @@ fn throw_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     let text = v8::String::new(scope, message).expect("error message");
     let exception = v8::Exception::error(scope, text);
     scope.throw_exception(exception);
+}
+
+fn reject(
+    scope: &mut v8::PinScope<'_, '_>,
+    resolver: v8::Local<v8::PromiseResolver>,
+    message: &str,
+) {
+    let message = v8::String::new(scope, message).expect("fetch error message");
+    let error = v8::Exception::error(scope, message);
+    resolver.reject(scope, error);
 }

@@ -1,7 +1,11 @@
 #[path = "../../../crates/runtime/tests/support/mod.rs"]
 mod support;
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 use support::Witness;
 
 struct TestDirectory(PathBuf);
@@ -25,11 +29,28 @@ impl TestDirectory {
     }
 
     fn run(&self, arguments: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_ondure"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ondure"))
             .current_dir(&self.0)
             .args(arguments)
-            .output()
-            .unwrap()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "ondure did not exit: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
 
@@ -153,4 +174,35 @@ fn failed_scripts_print_prior_output_before_the_error() {
             format!("warning\n{diagnostic}")
         );
     }
+}
+
+#[test]
+fn event_loop_finishes_timers_and_exits_when_idle() {
+    let directory = TestDirectory::new(
+        None,
+        r#"
+        console.log('starting');
+        const canceled = setTimeout(() => console.log('wrong'), 2147483647);
+        clearTimeout(canceled);
+        new Promise(() => {});
+        Promise.all(Array.from({length: 1000}, () => new Promise(resolve => setTimeout(resolve, 5))))
+            .then(() => console.log('finished'));
+    "#,
+    );
+    let output = directory.run(&["run", "agent.js"]);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"starting\nfinished\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn failed_script_finishes_pending_timers_before_printing_error() {
+    let directory = TestDirectory::new(
+        None,
+        "setTimeout(() => console.log('finished'), 5); throw Error('boom');",
+    );
+    let output = directory.run(&["run", "agent.js"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"finished\n");
+    assert_eq!(output.stderr, b"agent.js: Error: boom\n");
 }

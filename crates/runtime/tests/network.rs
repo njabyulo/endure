@@ -251,3 +251,97 @@ fn response_body_read_failure_reaches_catch_handler() {
     assert_eq!(output.stdout, "true\ncontinuing\n");
     assert!(output.stderr.contains("fetch failed:"));
 }
+
+#[test]
+fn requests_overlap_with_timers_and_continuations_can_submit_more() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        time::{Duration, Instant},
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/hit", listener.local_addr().unwrap());
+    let worker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut hits = 0;
+        // First three must arrive before any response is sent. The fourth is
+        // submitted by an await continuation after the first batch completes.
+        for count in [3, 1] {
+            let mut streams = Vec::new();
+            while streams.len() < count {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut request = Vec::new();
+                        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                            let mut buffer = [0; 1024];
+                            let n = stream.read(&mut buffer).unwrap();
+                            assert_ne!(n, 0);
+                            request.extend_from_slice(&buffer[..n]);
+                        }
+                        streams.push(stream);
+                        hits += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "requests did not overlap");
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            }
+            for mut stream in streams {
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n{\"hit\":1}").unwrap();
+            }
+        }
+        hits
+    });
+    let source = format!(
+        r#"
+        (async () => {{
+            const requests = [fetch('{url}'), fetch('{url}')];
+            requests.push(new Promise(resolve => setTimeout(() => {{
+                console.log('timer');
+                resolve(fetch('{url}'));
+            }}, 0)));
+            console.log('continuing');
+            const responses = await Promise.all(requests);
+            console.log('responses', responses.length);
+            console.log('hit', (await (await fetch('{url}')).json()).hit);
+        }})();
+    "#
+    );
+    let result = run_source(&Policy { net: true }, "overlap.js", &source);
+    assert_eq!(worker.join().unwrap(), 4);
+    assert_eq!(
+        result.unwrap().stdout,
+        "continuing\ntimer\nresponses 3\nhit 1\n"
+    );
+}
+
+#[test]
+fn unawaited_fetch_finishes_even_after_script_failure() {
+    for failure in ["", "throw Error('boom');"] {
+        let witness = Witness::new(200, r#"{"hit":1}"#);
+        let source = format!(
+            "fetch('{}').then(r => r.json()).then(body => console.log(body.hit)); {failure}",
+            witness.url()
+        );
+        let result = run_source(&Policy { net: true }, "unawaited.js", &source);
+        assert_eq!(witness.finish(), 1);
+        let output = match result {
+            Ok(output) => {
+                assert!(failure.is_empty());
+                output
+            }
+            Err(error) => {
+                assert_eq!(error.message, "Error: boom");
+                error.output
+            }
+        };
+        assert_eq!(output.stdout, "1\n");
+    }
+}

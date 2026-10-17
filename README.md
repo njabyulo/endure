@@ -2,7 +2,8 @@
 
 Run JavaScript in an embedded V8 isolate with policy-controlled network access.
 Use an async IIFE for `await`. The host provides `console.log`, `console.error`,
-and a minimal GET-only `fetch` with `ok`, `status`, and promise-returning `json()`.
+a minimal GET-only `fetch` with `ok`, `status`, and promise-returning `json()`,
+and one-shot `setTimeout` / `clearTimeout` timers.
 
 ## Build and run
 
@@ -28,6 +29,38 @@ Use `permissions: [net]` to allow network. Unknown permission names fail to load
 Allowed requests need a reachable server at the script's destination. A caught
 denial exits successfully. Use `examples/agent.js` for your own experiments;
 integration tests provide their own scripts and local servers.
+
+## Async execution
+
+`fetch` returns a pending promise immediately. HTTP runs on Tokio's blocking
+worker pool with the existing 10-second request timeout; JavaScript and all V8
+handles stay on the host thread. Multiple requests can run concurrently.
+
+```js
+(async () => {
+  const response = await fetch('http://127.0.0.1:8787/hit');
+  console.log(await response.json());
+})();
+```
+
+`setTimeout(callback, delayMs, ...args)` returns a numeric ID for `clearTimeout`.
+Callbacks run once, after synchronous JavaScript and its microtasks. Missing,
+NaN, or negative delays become zero; delays are capped at 2,147,483,647 ms.
+String callbacks are unsupported. Run the timer example without network access:
+
+```sh
+./build/ondure run examples/timers.js
+```
+
+The event loop waits for submitted HTTP operations and uncanceled timers,
+including work submitted by their continuations. An unresolved JavaScript promise
+alone does not keep the runtime alive. Microtasks drain between completions.
+
+If a script or timer callback throws, submitted work still completes before the
+first uncaught error is reported. Unhandled promise rejections are checked at
+idle. Output from the entire run is retained on failure. Infinite JavaScript or
+endlessly scheduled work can still prevent exit; CPU limits and cancellation of
+HTTP requests are not implemented. Journaling and replay are also not implemented.
 
 ## Check
 
@@ -55,7 +88,11 @@ Inside the runtime, each group covers a different lesson:
 4. `integrations/io.rs`: JavaScript console callbacks and captured output.
 5. `integrations/networking.rs`: fetch callbacks, permission enforcement, HTTP,
    and response promises.
-6. `capabilities/policy.rs`: Ondure's permission decisions and YAML loading,
+6. `core/event_loop.rs`: operation registration, Rust completions, promise
+   settlement, and idle detection. One Tokio current-thread runtime drives each
+   isolate; HTTP workers exchange owned Rust data with it.
+7. `integrations/timers.rs`: one-shot callbacks, arguments, and cancellation.
+8. `capabilities/policy.rs`: Ondure's permission decisions and YAML loading,
    independent of V8.
 
 The host keeps V8 scopes visible. Local handles live within those scopes;
