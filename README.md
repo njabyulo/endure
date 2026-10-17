@@ -209,5 +209,26 @@ process exit, including a crash.
 An intent without a result is ambiguous: a safe GET can be repeated. This is not
 an exactly-once guarantee for outside effects; unsafe tools are not exposed by
 this milestone. Divergence is fatal even if agent JavaScript catches the error.
-Console output is reconstructed during replay. Clock and random globals are not
-yet recorded in this layer, so scripts using them can diverge until C6.
+Console output is reconstructed during replay. Time and random values exposed through the supported durable globals are
+journaled as synchronous operations too.
+
+## Recorded time and randomness
+
+Durable runs replace `Date.now()`, no-argument `new Date()`, `Date()`,
+`performance.now()`, `Math.random()`, and `crypto.randomUUID()` with journal-backed
+bindings. Each value commits before returning to JavaScript; replay returns the
+recorded value. Explicit Date arguments, `Date.parse`, `Date.UTC`, subclasses,
+and `instanceof` retain their normal behavior. The original Date constructor is
+kept in a closure; replacing `Reflect.construct` cannot expose it.
+
+`WeakRef`, `FinalizationRegistry`, and `Temporal.Now` are removed from durable
+runs. Intl date formatting requires an explicit non-undefined date; omitted dates
+would otherwise read the current clock outside the journal. Ephemeral
+`run_source`/`run_module` embedding APIs keep their original globals. This is not
+engine/environment pinning: locale-sensitive formatting and explicit local-date
+parsing still depend on the host timezone and locale. Keep the execution
+environment stable and use UTC/explicit offsets for portable dates. Unprovided
+APIs such as workers and external entropy sources remain unavailable.
+
+Journal JSON uses round-trip float parsing so recorded random/performance values
+return identical floating-point values rather than nearby approximations.

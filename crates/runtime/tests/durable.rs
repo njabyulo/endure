@@ -223,3 +223,62 @@ fn replay_preserves_cancellation_and_completion_order() {
         first
     );
 }
+
+#[test]
+fn hundred_replays_return_identical_time_randomness_and_operation_sequence() {
+    let project = Project::new("console.log(JSON.stringify([Date.now(), new Date().getTime(), Date(), performance.now(), Math.random(), crypto.randomUUID()])); await new Promise(resolve => setTimeout(resolve, 1)); console.log(Math.random(), typeof WeakRef, typeof FinalizationRegistry);");
+    let graph = project.graph();
+    let first = run_durable(&Policy::default(), &graph, &project.journal(), "run").unwrap();
+    let history = Journal::open(&project.journal())
+        .unwrap()
+        .operations("run")
+        .unwrap();
+    for _ in 0..100 {
+        assert_eq!(
+            runtime::replay_run(&project.journal(), "run", None).unwrap(),
+            first
+        );
+        assert_eq!(
+            Journal::open(&project.journal())
+                .unwrap()
+                .operations("run")
+                .unwrap(),
+            history
+        );
+    }
+}
+
+#[test]
+fn changing_reflect_construct_cannot_expose_native_date() {
+    let project = Project::new("let leaked; const original = Reflect.construct; Reflect.construct = (target, args, newTarget) => { leaked = target; return original(target, args, newTarget); }; console.log(new Date().getTime() > 0, typeof leaked, new Date(0).toISOString());");
+    let first = run_durable(
+        &Policy::default(),
+        &project.graph(),
+        &project.journal(),
+        "run",
+    )
+    .unwrap();
+    assert_eq!(first.stdout, "true undefined 1970-01-01T00:00:00.000Z\n");
+    assert_eq!(
+        runtime::replay_run(&project.journal(), "run", None).unwrap(),
+        first
+    );
+}
+
+#[test]
+fn random_samples_round_trip_without_losing_float_bits() {
+    let project = Project::new(
+        "console.log(JSON.stringify(Array.from({length: 1000}, () => Math.random())));",
+    );
+    let first = run_durable(
+        &Policy::default(),
+        &project.graph(),
+        &project.journal(),
+        "run",
+    )
+    .unwrap();
+    assert_eq!(
+        runtime::replay_run(&project.journal(), "run", None).unwrap(),
+        first
+    );
+}
