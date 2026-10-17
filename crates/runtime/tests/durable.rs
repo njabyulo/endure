@@ -92,3 +92,77 @@ fn failures_and_canceled_timers_are_persisted() {
         .iter()
         .all(|op| op.state == "completed"));
 }
+
+#[test]
+fn completed_operations_replay_without_network_or_timer_wait() {
+    let witness = Witness::new(200, r#"{"hit":1}"#);
+    let project = Project::new(&format!("console.log((await (await fetch('{}')).json()).hit); await new Promise(resolve => setTimeout(resolve, 10));", witness.url()));
+    let graph = project.graph();
+    let first = run_durable(&Policy { net: true }, &graph, &project.journal(), "run").unwrap();
+    for _ in 0..3 {
+        let replayed = runtime::replay_run(&project.journal(), "run", None).unwrap();
+        assert_eq!(first, replayed);
+    }
+    assert_eq!(witness.finish(), 1);
+    assert_eq!(
+        Journal::open(&project.journal())
+            .unwrap()
+            .operations("run")
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn replay_checks_code_and_detects_divergent_operation_arguments() {
+    let project =
+        Project::new("await new Promise(resolve => setTimeout(resolve, 1)); console.log('done');");
+    run_durable(
+        &Policy::default(),
+        &project.graph(),
+        &project.journal(),
+        "run",
+    )
+    .unwrap();
+    fs::write(project.0.join("main.ts"), "console.log('changed');").unwrap();
+    let error = runtime::replay_run(&project.journal(), "run", Some(&project.graph())).unwrap_err();
+    assert!(error.message.contains("code hash mismatch"));
+    assert!(error.output.stdout.is_empty());
+    // An inconsistent historic argument digest must fail before callbacks run.
+    let connection = rusqlite::Connection::open(project.journal()).unwrap();
+    connection
+        .execute(
+            "UPDATE operations SET args_digest = 'different' WHERE run_id = 'run' AND seq = 0",
+            [],
+        )
+        .unwrap();
+    let error = runtime::replay_run(&project.journal(), "run", None).unwrap_err();
+    assert!(error.message.contains("replay divergence"));
+    assert!(error.output.stdout.is_empty());
+    assert_eq!(
+        Journal::open(&project.journal())
+            .unwrap()
+            .get_run("run")
+            .unwrap()
+            .status,
+        "diverged"
+    );
+}
+
+#[test]
+fn replay_preserves_cancellation_and_completion_order() {
+    let project = Project::new("const id = setTimeout(() => console.log('wrong'), 1000); clearTimeout(id); const a = new Promise(resolve => setTimeout(() => {console.log('slow'); resolve(1);}, 10)); const b = new Promise(resolve => setTimeout(() => {console.log('fast'); resolve(2);}, 0)); console.log(await Promise.race([a,b])); await a;");
+    let first = run_durable(
+        &Policy::default(),
+        &project.graph(),
+        &project.journal(),
+        "run",
+    )
+    .unwrap();
+    assert_eq!(first.stdout, "fast\n2\nslow\n");
+    assert_eq!(
+        runtime::replay_run(&project.journal(), "run", None).unwrap(),
+        first
+    );
+}

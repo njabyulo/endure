@@ -61,8 +61,8 @@ Both paths execute captured code without rereading files, even if the original
 files change or disappear. Loading is not an atomic filesystem snapshot.
 
 The CLI persists graph snapshots and hashes with journaled runs. In-memory
-`run_module` remains available without journaling. Replay is a later milestone;
-code identity does not pin engine versions.
+`run_module` remains available without journaling. Replay uses the captured graph and verifies its integrity; code identity does
+not pin engine versions.
 All compilation and hashing dependencies belong to the runtime crate.
 
 ## Permissions
@@ -107,7 +107,7 @@ If a script or timer callback throws, submitted work still completes before the
 first uncaught error is reported. Unhandled promise rejections are checked at
 idle. Output from the entire run is retained on failure. Infinite JavaScript or
 endlessly scheduled work can still prevent exit; CPU limits and cancellation of
-HTTP requests are not implemented. Replay is not implemented in this layer.
+HTTP requests are not implemented. Recorded operations can be replayed without repeating completed effects.
 
 For Rust embedding, `run_source` and `run_module` are synchronous and block until idle.
 `run_source` retains classic JavaScript script semantics and requires an async
@@ -182,9 +182,28 @@ embedding APIs. Captured code and the run's network
 policy are stored with the run. Console output is captured again at finalization;
 it is not an external exactly-once effect.
 
-A killed process can leave an intent without a result. This layer records that
-ambiguity and does not yet resume it. A committed result survives process death;
+A killed process can leave an intent without a result. Replay retries unfinished
+GET and timer operations under their `safe` policy; completed results are reused. A committed result survives process death;
 power-loss durability additionally depends on the filesystem and storage device
 honoring SQLite's synchronization requests. The crash regression kills 100
 processes after an external witness sees a JS await continuation and verifies
 that every acknowledged result remains in the journal.
+
+## Crash recovery and replay
+
+```sh
+./build/ondure replay example --journal .ondure/journal.sqlite3
+```
+
+Replay executes the captured module graph with its recorded network policy.
+It validates operation names, argument digests, replay policies, and completion
+order, supplying recorded results without opening sockets or repeating timer
+waits. After the recorded prefix it may continue an unfinished run. Completed
+runs reject unexpected extra operations. A changed graph passed through the Rust
+`replay_run` verification API fails its code-hash check before execution.
+
+An intent without a result is ambiguous: a safe GET can be repeated. This is not
+an exactly-once guarantee for outside effects; unsafe tools are not exposed by
+this milestone. Divergence is fatal even if agent JavaScript catches the error.
+Console output is reconstructed during replay. Clock and random globals are not
+yet recorded in this layer, so scripts using them can diverge until C6.
