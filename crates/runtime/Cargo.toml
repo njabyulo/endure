@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 v8 = "152.2.0"

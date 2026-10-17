@@ -222,12 +222,23 @@ fn run_on_thread(
         let mut evaluation = None;
         let failure = {
             v8::tc_scope!(let scope, scope);
-            let result = match program {
+            let installed = if scope
+                .get_slot::<HostState>()
+                .expect("host state installed")
+                .session
+                .borrow()
+                .is_some()
+            {
+                crate::capabilities::determinism::install(scope)
+            } else {
+                Ok(())
+            };
+            let result = installed.and_then(|()| match program {
                 Program::Script(source) => execution::compile_and_run(scope, filename, source),
                 Program::Module(graph) => {
                     modules::evaluate(scope, graph).map(|promise| evaluation = Some(promise))
                 }
-            };
+            });
             let failure = result.err().map(|fallback| {
                 scope
                     .exception()
