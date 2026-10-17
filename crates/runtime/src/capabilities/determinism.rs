@@ -8,12 +8,16 @@
 use crate::host::HostState;
 use serde_json::{json, Value};
 use std::{
-    sync::OnceLock,
+    cell::RefCell,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Install before user code, and only when a durable session is present.
 pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
+    scope.set_slot(RefCell::new(PerformanceClock {
+        anchor: Instant::now(),
+        offset: 0.0,
+    }));
     let global = scope.get_current_context().global(scope);
     let date_key = v8::String::new(scope, "Date").ok_or("Date key allocation failed")?;
     let native_date = global
@@ -164,17 +168,37 @@ fn date_string(
     return_string(scope, result, &mut output);
 }
 
+struct PerformanceClock {
+    anchor: Instant,
+    offset: f64,
+}
+
 fn performance_now(
     scope: &mut v8::PinScope<'_, '_>,
     _: v8::FunctionCallbackArguments,
     mut output: v8::ReturnValue,
 ) {
-    let result = journal(scope, "clock.performance", || {
-        static ORIGIN: OnceLock<Instant> = OnceLock::new();
-        Ok(json!(
-            ORIGIN.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
-        ))
-    });
+    let sampled_at = Instant::now();
+    let candidate = {
+        let clock = scope
+            .get_slot::<RefCell<PerformanceClock>>()
+            .expect("performance clock installed")
+            .borrow();
+        clock.offset + sampled_at.duration_since(clock.anchor).as_secs_f64() * 1000.0
+    };
+    let result = journal(scope, "clock.performance", || Ok(json!(candidate)));
+    if let Ok(value) = &result {
+        if let Some(value) = value.as_f64() {
+            let mut clock = scope
+                .get_slot::<RefCell<PerformanceClock>>()
+                .expect("performance clock installed")
+                .borrow_mut();
+            // Recorded values establish the continuation offset too. A resumed
+            // run never resets its performance clock to the process origin.
+            clock.offset = value;
+            clock.anchor = sampled_at;
+        }
+    }
     return_number(scope, result, &mut output);
 }
 

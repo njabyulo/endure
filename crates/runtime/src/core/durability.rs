@@ -209,9 +209,6 @@ impl Session {
             args_digest: digest(args),
             policy: policy.into(),
         });
-        if self.intents.len() >= 256 || self.last_flush.elapsed() >= Duration::from_millis(2) {
-            self.flush()?;
-        }
         Ok(seq)
     }
 
@@ -224,6 +221,9 @@ impl Session {
     ) -> Result<(), String> {
         let seq = self.intent(name, args, policy)?;
         self.pending.insert(id, seq);
+        if self.intents.len() >= 256 || self.last_flush.elapsed() >= Duration::from_millis(2) {
+            self.flush()?;
+        }
         Ok(())
     }
 
@@ -269,6 +269,9 @@ impl Session {
         Ok(())
     }
 
+    /// Capture a safe synchronous value and commit intent plus result together.
+    /// Producers must have no external effects: a crash before commit can retry
+    /// them, and JavaScript cannot observe the value until commit succeeds.
     pub(crate) fn sync_op(
         &mut self,
         name: &str,
@@ -276,7 +279,6 @@ impl Session {
         produce: impl FnOnce() -> Result<Value, String>,
     ) -> Result<Value, String> {
         let seq = self.intent(name, args, "safe")?;
-        self.flush()?;
         if let Some(recorded) = self.history.get(&seq) {
             if recorded.state == "completed" {
                 let encoded = recorded.result.clone().ok_or("recorded result missing")?;
@@ -287,8 +289,10 @@ impl Session {
         let result = produce();
         let encoded = serde_json::to_string(&result).map_err(|e| e.to_string())?;
         self.journal
-            .complete(&self.run_id, seq, &encoded)
+            .complete_sync(&self.run_id, &self.intents, seq, &encoded)
             .map_err(|e| e.to_string())?;
+        self.intents.clear();
+        self.last_flush = Instant::now();
         result
     }
 

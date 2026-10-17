@@ -179,33 +179,7 @@ impl Journal {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for intent in intents {
-            let seq = sequence(intent.seq)?;
-            let existing = transaction
-                .query_row(
-                    "SELECT name, args_digest, policy FROM operations WHERE run_id = ?1 AND seq = ?2",
-                    params![run_id, seq],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-                )
-                .optional()?;
-            if let Some((name, args_digest, policy)) = existing {
-                if name != intent.name
-                    || args_digest != intent.args_digest
-                    || policy != intent.policy
-                {
-                    return Err(JournalError(format!(
-                        "journal: intent mismatch at operation {}",
-                        intent.seq
-                    )));
-                }
-                continue;
-            }
-            transaction.execute(
-                "INSERT INTO operations (run_id, seq, name, args_digest, policy, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
-                params![run_id, seq, intent.name, intent.args_digest, intent.policy],
-            )?;
-        }
+        write_intents(&transaction, run_id, intents)?;
         transaction.commit()?;
         Ok(())
     }
@@ -224,29 +198,25 @@ impl Journal {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (seq, result) in results {
-            let seq = sequence(*seq)?;
-            let existing: Option<String> = transaction.query_row(
-                "SELECT result FROM operations WHERE run_id = ?1 AND seq = ?2",
-                params![run_id, seq],
-                |row| row.get(0),
-            )?;
-            if let Some(existing) = existing {
-                if existing != *result {
-                    return Err(JournalError(format!(
-                        "journal: result mismatch at operation {seq}"
-                    )));
-                }
-            } else {
-                transaction.execute(
-                    "UPDATE operations SET state = 'completed', result = ?3,
-                         completion_order = (SELECT COALESCE(MAX(completion_order), -1) + 1
-                                             FROM operations WHERE run_id = ?1)
-                     WHERE run_id = ?1 AND seq = ?2",
-                    params![run_id, seq, result],
-                )?;
-            }
-        }
+        write_completions(&transaction, run_id, results)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically commit safe synchronous intents and their observed result.
+    /// No value is exposed to JavaScript before this transaction commits.
+    pub(crate) fn complete_sync(
+        &mut self,
+        run_id: &str,
+        intents: &[OpIntent],
+        seq: u64,
+        result: &str,
+    ) -> Result<(), JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        write_intents(&transaction, run_id, intents)?;
+        write_completions(&transaction, run_id, &[(seq, result.to_owned())])?;
         transaction.commit()?;
         Ok(())
     }
@@ -298,6 +268,75 @@ fn require_one(changed: usize) -> Result<(), JournalError> {
     }
 }
 
+fn write_intents(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: &str,
+    intents: &[OpIntent],
+) -> Result<(), JournalError> {
+    for intent in intents {
+        let seq = sequence(intent.seq)?;
+        let existing = transaction
+            .query_row(
+                "SELECT name, args_digest, policy FROM operations WHERE run_id = ?1 AND seq = ?2",
+                params![run_id, seq],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((name, args_digest, policy)) = existing {
+            if name != intent.name || args_digest != intent.args_digest || policy != intent.policy {
+                return Err(JournalError(format!(
+                    "journal: intent mismatch at operation {}",
+                    intent.seq
+                )));
+            }
+            continue;
+        }
+        transaction.execute(
+            "INSERT INTO operations (run_id, seq, name, args_digest, policy, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
+            params![run_id, seq, intent.name, intent.args_digest, intent.policy],
+        )?;
+    }
+    Ok(())
+}
+
+fn write_completions(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: &str,
+    results: &[(u64, String)],
+) -> Result<(), JournalError> {
+    for (seq, result) in results {
+        let seq = sequence(*seq)?;
+        let existing: Option<String> = transaction.query_row(
+            "SELECT result FROM operations WHERE run_id = ?1 AND seq = ?2",
+            params![run_id, seq],
+            |row| row.get(0),
+        )?;
+        if let Some(existing) = existing {
+            if existing != *result {
+                return Err(JournalError(format!(
+                    "journal: result mismatch at operation {seq}"
+                )));
+            }
+        } else {
+            transaction.execute(
+                "UPDATE operations SET state = 'completed', result = ?3,
+                         completion_order = (SELECT COALESCE(MAX(completion_order), -1) + 1
+                                             FROM operations WHERE run_id = ?1)
+                     WHERE run_id = ?1 AND seq = ?2",
+                params![run_id, seq, result],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +358,39 @@ mod tests {
         journal
             .create_run("run", Some("request"), "hash", "input", "graph")
             .unwrap();
+    }
+
+    #[test]
+    fn synchronous_result_and_intents_commit_or_roll_back_together() {
+        let path = temporary_path();
+        let mut journal = Journal::open(&path).unwrap();
+        create(&mut journal);
+        journal
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_completion BEFORE UPDATE ON operations
+             BEGIN SELECT RAISE(ABORT, 'injected completion failure'); END;",
+            )
+            .unwrap();
+        assert!(journal
+            .complete_sync("run", &[intent(0), intent(1)], 1, "value")
+            .is_err());
+        assert!(journal.operations("run").unwrap().is_empty());
+        journal
+            .connection
+            .execute_batch("DROP TRIGGER fail_completion")
+            .unwrap();
+        journal
+            .complete_sync("run", &[intent(0), intent(1)], 1, "value")
+            .unwrap();
+        let operations = Journal::open(&path).unwrap().operations("run").unwrap();
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0].state, "pending");
+        assert_eq!(operations[1].state, "completed");
+        assert_eq!(operations[1].result.as_deref(), Some("value"));
+        assert_eq!(operations[1].completion_order, Some(0));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

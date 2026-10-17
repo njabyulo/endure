@@ -282,3 +282,40 @@ fn random_samples_round_trip_without_losing_float_bits() {
         first
     );
 }
+
+#[test]
+fn resumed_performance_clock_continues_from_last_recorded_value() {
+    let project = Project::new("const first = performance.now(); const second = performance.now(); console.log(first, second >= first);");
+    run_durable(
+        &Policy::default(),
+        &project.graph(),
+        &project.journal(),
+        "run",
+    )
+    .unwrap();
+    // Model a crashed process with one completed clock read and no remaining
+    // operations. Its recorded elapsed time is ahead of this process's origin.
+    let connection = rusqlite::Connection::open(project.journal()).unwrap();
+    connection
+        .execute(
+            "DELETE FROM operations WHERE run_id = 'run' AND seq > 0",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE operations SET result = '{"Ok":1000000000.0}' WHERE run_id = 'run' AND seq = 0"#,
+            [],
+        )
+        .unwrap();
+    connection
+        .execute("UPDATE runs SET status = 'running' WHERE id = 'run'", [])
+        .unwrap();
+    drop(connection);
+    let resumed = runtime::replay_run(&project.journal(), "run", None).unwrap();
+    assert_eq!(resumed.stdout, "1000000000 true\n");
+    assert_eq!(
+        runtime::replay_run(&project.journal(), "run", None).unwrap(),
+        resumed
+    );
+}
