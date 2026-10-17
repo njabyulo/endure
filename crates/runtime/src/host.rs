@@ -41,7 +41,36 @@ impl fmt::Display for HostError {
 
 impl std::error::Error for HostError {}
 
+/// Execute JavaScript and wait for all submitted host operations.
+///
+/// This function blocks its caller. Inside Tokio it runs the entire isolate on
+/// a separate thread to avoid nesting executors. Async callers should use
+/// `spawn_blocking` when they need their own executor to keep making progress.
 pub fn run_source(policy: &Policy, filename: &str, source: &str) -> Result<RunOutput, HostError> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::scope(|threads| {
+            let worker = std::thread::Builder::new()
+                .name("ondure-isolate".into())
+                .spawn_scoped(threads, || run_on_thread(policy, filename, source))
+                .map_err(|error| HostError {
+                    filename: filename.into(),
+                    message: format!("isolate thread initialization failed: {error}"),
+                    output: RunOutput::default(),
+                })?;
+            worker.join().unwrap_or_else(|_| {
+                Err(HostError {
+                    filename: filename.into(),
+                    message: "isolate thread panicked".into(),
+                    output: RunOutput::default(),
+                })
+            })
+        });
+    }
+    run_on_thread(policy, filename, source)
+}
+
+// Create, execute, and dispose both V8 and Tokio on the same host thread.
+fn run_on_thread(policy: &Policy, filename: &str, source: &str) -> Result<RunOutput, HostError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -141,5 +170,32 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.output, RunOutput::default());
         assert!(error.message.contains("SyntaxError"));
+    }
+
+    #[test]
+    fn tokio_callers_receive_output_and_errors_without_nested_runtime_panics() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let output = run_source(&Policy::default(), "sync.js", "console.log('sync');").unwrap();
+            assert_eq!(output.stdout, "sync\n");
+            let output = run_source(
+                &Policy::default(),
+                "timer.js",
+                "setTimeout(() => console.log('done'), 1);",
+            )
+            .unwrap();
+            assert_eq!(output.stdout, "done\n");
+            let error = run_source(
+                &Policy::default(),
+                "failure.js",
+                "setTimeout(() => console.log('done'), 1); throw Error('boom');",
+            )
+            .unwrap_err();
+            assert_eq!(error.message, "Error: boom");
+            assert_eq!(error.output.stdout, "done\n");
+        });
     }
 }

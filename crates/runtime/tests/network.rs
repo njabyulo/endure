@@ -345,3 +345,18 @@ fn unawaited_fetch_finishes_even_after_script_failure() {
         assert_eq!(output.stdout, "1\n");
     }
 }
+
+#[test]
+fn tokio_caller_can_complete_fetch_and_await_json() {
+    let witness = Witness::new(200, r#"{"hit":1}"#);
+    let source = format!("(async () => {{ const response = await fetch('{}'); console.log((await response.json()).hit); }})();", witness.url());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let output = runtime
+        .block_on(async { run_source(&Policy { net: true }, "tokio-fetch.js", &source) })
+        .unwrap();
+    assert_eq!(output.stdout, "1\n");
+    assert_eq!(witness.finish(), 1);
+}

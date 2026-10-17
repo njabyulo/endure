@@ -6,7 +6,7 @@
 
 use crate::{host::HostState, integrations::networking};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
 };
 use tokio::{runtime::Runtime, task::JoinSet};
@@ -19,6 +19,7 @@ pub(crate) struct Operations {
     queued: Vec<(OperationId, String)>,
     fetches: BTreeMap<OperationId, v8::Global<v8::PromiseResolver>>,
     timers: BTreeMap<OperationId, Timer>,
+    deadlines: BTreeSet<(Instant, OperationId)>,
 }
 
 struct Timer {
@@ -52,10 +53,12 @@ impl Operations {
         arguments: Vec<v8::Global<v8::Value>>,
     ) -> OperationId {
         let id = self.id();
+        let deadline = Instant::now() + delay;
+        self.deadlines.insert((deadline, id));
         self.timers.insert(
             id,
             Timer {
-                deadline: Instant::now() + delay,
+                deadline,
                 callback,
                 arguments,
             },
@@ -64,14 +67,17 @@ impl Operations {
     }
 
     pub(crate) fn cancel_timer(&mut self, id: OperationId) {
-        self.timers.remove(&id);
+        self.remove_timer(id);
+    }
+
+    fn remove_timer(&mut self, id: OperationId) -> Option<Timer> {
+        let timer = self.timers.remove(&id)?;
+        self.deadlines.remove(&(timer.deadline, id));
+        Some(timer)
     }
 
     fn next_timer(&self) -> Option<(OperationId, Instant)> {
-        self.timers
-            .iter()
-            .map(|(&id, timer)| (id, timer.deadline))
-            .min_by_key(|&(id, deadline)| (deadline, id))
+        self.deadlines.first().map(|&(deadline, id)| (id, deadline))
     }
 }
 
@@ -173,8 +179,7 @@ pub(crate) fn run(
                     .expect("host state installed")
                     .operations
                     .borrow_mut()
-                    .timers
-                    .remove(&id);
+                    .remove_timer(id);
                 if let Some(timer) = timer {
                     let callback = v8::Local::new(scope, &timer.callback);
                     let args: Vec<_> = timer

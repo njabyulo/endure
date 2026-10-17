@@ -62,6 +62,11 @@ idle. Output from the entire run is retained on failure. Infinite JavaScript or
 endlessly scheduled work can still prevent exit; CPU limits and cancellation of
 HTTP requests are not implemented. Journaling and replay are also not implemented.
 
+For Rust embedding, `run_source` is synchronous and blocks until idle. Calls
+from an entered Tokio runtime create and dispose the isolate on a separate
+thread to avoid nested runtime panics. Use Tokio's `spawn_blocking` at async
+call sites when the caller's executor must remain responsive.
+
 ## Check
 
 ```sh

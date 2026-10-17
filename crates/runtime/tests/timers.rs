@@ -164,3 +164,46 @@ fn rejection_stringification_cannot_hide_new_microtasks() {
     assert_eq!(error.message, "unhandled promise rejection: reason");
     assert_eq!(error.output.stdout, "finished\n");
 }
+
+#[test]
+fn timers_follow_deadlines_after_cancellation_and_rescheduling() {
+    let output = run_source(
+        &Policy::default(),
+        "deadlines.js",
+        r#"
+        const last = setTimeout(() => console.log('wrong-last'), 1000);
+        setTimeout(() => console.log('later'), 20);
+        const first = setTimeout(() => console.log('wrong-first'), 0);
+        clearTimeout(first);
+        clearTimeout(last);
+        setTimeout(() => {
+            console.log('early');
+            setTimeout(() => console.log('rescheduled'), 0);
+        }, 0);
+    "#,
+    )
+    .unwrap();
+    let mut lines = output.stdout.lines();
+    assert_eq!(lines.next(), Some("early"));
+    // The rescheduled timer's deadline can fall after 'later' on a busy host.
+    let mut remaining: Vec<_> = lines.collect();
+    remaining.sort_unstable();
+    assert_eq!(remaining, ["later", "rescheduled"]);
+}
+
+#[test]
+fn large_timer_batch_completes_after_canceling_half() {
+    let output = run_source(
+        &Policy::default(),
+        "large-batch.js",
+        r#"
+        let count = 0;
+        for (let i = 0; i < 20000; i++) {
+            const id = setTimeout(() => { if (++count === 10000) console.log(count); }, 0);
+            if (i % 2 === 0) clearTimeout(id);
+        }
+    "#,
+    )
+    .unwrap();
+    assert_eq!(output.stdout, "10000\n");
+}
