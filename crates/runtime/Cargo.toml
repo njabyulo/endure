@@ -10,3 +10,5 @@ serde_yaml = "0.9"
 v8 = "152.2.0"
 ureq = "2"
 tokio = { version = "1", features = ["rt", "time", "macros"] }
+sha2 = "0.10"
+swc_core = { version = "82.1.1", features = ["common", "ecma_ast", "ecma_codegen", "ecma_parser_typescript", "ecma_transforms_typescript", "ecma_visit"] }

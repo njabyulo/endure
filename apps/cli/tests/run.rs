@@ -269,3 +269,45 @@ fn timeout_still_kills_and_reaps_a_stuck_child() {
     let message = failure.downcast_ref::<String>().unwrap();
     assert!(message.contains("ondure did not exit:"));
 }
+
+#[test]
+fn typescript_entry_and_local_imports_run_without_a_build_step() {
+    let directory = TestDirectory::new(None, "import './agent.ts';");
+    fs::write(directory.0.join("agent.ts"), "import {value} from './value.ts'; const result: number = await new Promise(resolve => setTimeout(resolve, 1, value)); console.log(result, typeof require, typeof process);").unwrap();
+    fs::write(
+        directory.0.join("value.ts"),
+        "export const value: number = 42;",
+    )
+    .unwrap();
+    for entry in ["agent.js", "agent.ts"] {
+        let output = directory.run(&["run", entry]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"42 undefined undefined\n");
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn module_preparation_fails_before_console_output() {
+    let directory = TestDirectory::new(None, "console.log('wrong'); import './missing.ts';");
+    let output = directory.run(&["run", "agent.js"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing.ts"));
+}
+
+#[test]
+fn unresolved_top_level_await_exits_with_an_error() {
+    let directory = TestDirectory::new(
+        None,
+        "console.log('starting'); await new Promise(() => {});",
+    );
+    let output = directory.run(&["run", "agent.js"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"starting\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("module evaluation is pending"));
+}

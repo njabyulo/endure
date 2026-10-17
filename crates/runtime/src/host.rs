@@ -2,10 +2,10 @@
 //!
 //! Policy and buffers stay in a Rust-owned isolate slot, outside JavaScript's
 //! globals. Local handles follow the visible scopes below; Global handles retain
-//! pending resolvers, timer callbacks, and unhandled rejection reasons.
+//! compiled modules, pending resolvers, timer callbacks, and rejection reasons.
 
 use crate::{
-    core::{embedding, event_loop, execution, microtasks},
+    core::{embedding, event_loop, execution, microtasks, modules},
     integrations::{io, networking, timers},
     Policy,
 };
@@ -47,11 +47,44 @@ impl std::error::Error for HostError {}
 /// a separate thread to avoid nesting executors. Async callers should use
 /// `spawn_blocking` when they need their own executor to keep making progress.
 pub fn run_source(policy: &Policy, filename: &str, source: &str) -> Result<RunOutput, HostError> {
+    execute(policy, filename, Program::Script(source))
+}
+
+/// Execute a prepared graph, optionally requiring the code hash of a prior run.
+/// Hash mismatch fails before isolate creation or JavaScript side effects.
+/// Like `run_source`, this blocks its caller and supports entered Tokio contexts.
+pub fn run_module(
+    policy: &Policy,
+    graph: &modules::ModuleGraph,
+    expected_hash: Option<&str>,
+) -> Result<RunOutput, HostError> {
+    if let Some(expected) = expected_hash {
+        if expected != graph.code_hash() {
+            return Err(HostError {
+                filename: graph.filename.clone(),
+                message: format!(
+                    "code hash mismatch: expected {expected}, actual {}",
+                    graph.code_hash()
+                ),
+                output: RunOutput::default(),
+            });
+        }
+    }
+    execute(policy, &graph.filename, Program::Module(graph))
+}
+
+#[derive(Clone, Copy)]
+enum Program<'a> {
+    Script(&'a str),
+    Module(&'a modules::ModuleGraph),
+}
+
+fn execute(policy: &Policy, filename: &str, program: Program<'_>) -> Result<RunOutput, HostError> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return std::thread::scope(|threads| {
             let worker = std::thread::Builder::new()
                 .name("ondure-isolate".into())
-                .spawn_scoped(threads, || run_on_thread(policy, filename, source))
+                .spawn_scoped(threads, || run_on_thread(policy, filename, program))
                 .map_err(|error| HostError {
                     filename: filename.into(),
                     message: format!("isolate thread initialization failed: {error}"),
@@ -66,11 +99,15 @@ pub fn run_source(policy: &Policy, filename: &str, source: &str) -> Result<RunOu
             })
         });
     }
-    run_on_thread(policy, filename, source)
+    run_on_thread(policy, filename, program)
 }
 
 // Create, execute, and dispose both V8 and Tokio on the same host thread.
-fn run_on_thread(policy: &Policy, filename: &str, source: &str) -> Result<RunOutput, HostError> {
+fn run_on_thread(
+    policy: &Policy,
+    filename: &str,
+    program: Program<'_>,
+) -> Result<RunOutput, HostError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -81,6 +118,7 @@ fn run_on_thread(policy: &Policy, filename: &str, source: &str) -> Result<RunOut
         })?;
     let mut isolate = embedding::new_isolate();
     microtasks::install(&mut isolate);
+    isolate.set_host_import_module_dynamically_callback(modules::reject_dynamic_import);
     isolate.set_slot(HostState {
         policy: *policy,
         stdout: RefCell::new(String::new()),
@@ -97,22 +135,29 @@ fn run_on_thread(policy: &Policy, filename: &str, source: &str) -> Result<RunOut
         networking::install(scope);
         timers::install(scope);
 
+        let mut evaluation = None;
         let failure = {
             v8::tc_scope!(let scope, scope);
-            let failure = execution::compile_and_run(scope, filename, source)
-                .err()
-                .map(|fallback| {
-                    scope
-                        .exception()
-                        .map(|error| error.to_rust_string_lossy(scope))
-                        .unwrap_or(fallback)
-                });
+            let result = match program {
+                Program::Script(source) => execution::compile_and_run(scope, filename, source),
+                Program::Module(graph) => {
+                    modules::evaluate(scope, graph).map(|promise| evaluation = Some(promise))
+                }
+            };
+            let failure = result.err().map(|fallback| {
+                scope
+                    .exception()
+                    .map(|error| error.to_rust_string_lossy(scope))
+                    .unwrap_or(fallback)
+            });
             scope.reset();
             failure
         };
-        event_loop::run(scope, &runtime, failure)
+        event_loop::run(scope, &runtime, failure, evaluation.as_ref())
     };
 
+    // Drop all module handles while their isolate is still alive.
+    isolate.remove_slot::<modules::ModuleStore>();
     let state = isolate
         .remove_slot::<HostState>()
         .expect("host state installed");

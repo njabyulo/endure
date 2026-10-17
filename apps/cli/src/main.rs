@@ -1,5 +1,5 @@
-use runtime::{run_source, Policy, RunOutput};
-use std::{error::Error, fs, io::Write, path::Path, process::ExitCode};
+use runtime::{run_module, ModuleGraph, Policy, RunOutput};
+use std::{error::Error, io::Write, path::Path, process::ExitCode};
 
 fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args_os().skip(1);
@@ -13,8 +13,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let policy = Policy::load(Path::new("ondure.yaml"))?;
     let script = script.expect("script argument checked");
-    let source = fs::read_to_string(&script)?;
-    let output = match run_source(&policy, &script.to_string_lossy(), &source) {
+    let graph = ModuleGraph::load(Path::new(&script))?;
+    let output = match run_module(&policy, &graph, None) {
         Ok(output) => output,
         Err(error) => {
             write_output(&error.output)?;

@@ -6,4 +6,5 @@ mod host;
 mod integrations;
 
 pub use capabilities::policy::{Policy, PolicyError};
-pub use host::{run_source, HostError, RunOutput};
+pub use core::modules::{ModuleError, ModuleGraph};
+pub use host::{run_module, run_source, HostError, RunOutput};

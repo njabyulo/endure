@@ -113,18 +113,33 @@ pub(crate) fn run(
     scope: &mut v8::PinScope<'_, '_>,
     runtime: &Runtime,
     mut failure: Option<String>,
+    evaluation: Option<&v8::Global<v8::Promise>>,
 ) -> Result<(), String> {
     let mut tasks = JoinSet::new();
     loop {
+        let mut module_failed = false;
         {
             v8::scope!(let scope, scope);
             v8::tc_scope!(let scope, scope);
             super::microtasks::drain(scope);
+            if failure.is_none() {
+                if let Some(evaluation) = evaluation {
+                    let promise = v8::Local::new(scope, evaluation);
+                    if promise.state() == v8::PromiseState::Rejected {
+                        failure = Some(promise.result(scope).to_rust_string_lossy(scope));
+                        module_failed = true;
+                    }
+                }
+            }
             if let Some(exception) = scope.exception() {
                 let message = exception.to_rust_string_lossy(scope);
                 failure.get_or_insert(message);
                 scope.reset();
             }
+        }
+        if module_failed {
+            // Rendering a user-thrown value can enqueue more microtasks.
+            continue;
         }
         // Release the isolate-slot borrow before any JavaScript can run.
         let (queued, timer) = {
@@ -153,6 +168,15 @@ pub(crate) fn run(
             let state = scope.get_slot::<HostState>().expect("host state installed");
             let ops = state.operations.borrow();
             if ops.queued.is_empty() && ops.timers.is_empty() {
+                drop(ops);
+                if let Some(evaluation) = evaluation {
+                    let promise = v8::Local::new(scope, evaluation);
+                    if promise.state() == v8::PromiseState::Pending {
+                        failure.get_or_insert_with(|| {
+                            "module evaluation is pending but no host operations remain".into()
+                        });
+                    }
+                }
                 break;
             }
             continue;
