@@ -66,6 +66,7 @@ fn hundred_killed_runs_keep_every_acknowledged_result() {
         });
         let run_id = format!("crash-{iteration}");
         let mut child = Command::new(env!("CARGO_BIN_EXE_ondure"))
+            .arg("__worker")
             .current_dir(&root)
             .args(["run", "agent.js", "--run-id", &run_id, "--journal"])
             .arg(&journal_path)

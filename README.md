@@ -268,3 +268,26 @@ Retries return the same run and cached terminal output; changed identity fails.
 OS file locks prevent concurrent owners of the same request or run and release
 on process death. Journal and lease files must share local storage; this is not
 a distributed executor or an exactly-once guarantee for external effects.
+
+
+## Execution limits
+
+The CLI supervises execution in a disposable worker process. Defaults are a
+1,000 ms active-execution budget and a 128 MiB V8 managed-heap limit. Override
+with `--cpu-ms` and `--heap-mb` on run, replay, approve, or wake; zero disables
+that limit. Rust callers can use the `*_with_limits` APIs with `RunLimits`;
+existing embedding APIs remain unlimited.
+
+The watchdog accumulates active elapsed time across initial evaluation,
+callbacks, and microtasks. Waiting for HTTP and timers does not consume the
+budget. This is elapsed active time, not OS CPU accounting. A tight loop or
+endless microtask chain terminates, and captured logs and failed status are
+written to the journal. Each resume receives a new per-execution budget.
+
+The heap limit covers V8's managed heap, with emergency allocation headroom for
+termination. It does not bound process RSS, Rust buffers, or external allocations.
+The CLI parent contains a native worker abort and reports a nonzero exit; SQLite
+can reopen the journal and another worker can run. A native crash may leave a
+running record for replay and cannot flush in-memory console output. Process
+containment does not protect against system-wide kernel OOM. The Rust library
+alone does not contain fatal native allocation failures.

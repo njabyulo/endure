@@ -8,14 +8,19 @@ use std::sync::Once;
 
 static INITIALIZE: Once = Once::new();
 
-pub(crate) fn new_isolate() -> v8::OwnedIsolate {
+pub(crate) fn new_isolate_with_heap_limit(heap_mb: usize) -> v8::OwnedIsolate {
     INITIALIZE.call_once(|| {
         let platform = v8::new_default_platform(0, false).make_shared();
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
     });
 
-    v8::Isolate::new(Default::default())
+    let params = if heap_mb == 0 {
+        v8::CreateParams::default()
+    } else {
+        v8::CreateParams::default().heap_limits(0, heap_mb.saturating_mul(1024 * 1024))
+    };
+    v8::Isolate::new(params)
 }
 
 pub(crate) fn set_property<'s>(
