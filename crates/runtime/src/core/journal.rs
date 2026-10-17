@@ -53,6 +53,16 @@ pub struct OpRecord {
     pub completion_order: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitRecord {
+    pub run_id: String,
+    pub seq: u64,
+    pub kind: String,
+    pub wake_at: Option<i64>,
+    pub answer: Option<String>,
+    pub details: String,
+}
+
 pub struct Journal {
     connection: Connection,
 }
@@ -89,6 +99,16 @@ impl Journal {
                  UNIQUE(run_id, completion_order),
                  CHECK((state = 'pending' AND result IS NULL AND completion_order IS NULL)
                     OR (state = 'completed' AND result IS NOT NULL AND completion_order IS NOT NULL))
+             );
+             CREATE TABLE IF NOT EXISTS waits (
+                 run_id TEXT NOT NULL,
+                 seq INTEGER NOT NULL CHECK(seq >= 0),
+                 kind TEXT NOT NULL,
+                 wake_at INTEGER,
+                 answer TEXT,
+                 details TEXT NOT NULL,
+                 PRIMARY KEY(run_id, seq),
+                 FOREIGN KEY(run_id, seq) REFERENCES operations(run_id, seq)
              );
              COMMIT;",
         )?;
@@ -142,6 +162,24 @@ impl Journal {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn parked_runs(&self) -> Result<Vec<RunRecord>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, request_id, code_hash, input_digest, graph, status, stdout, stderr
+             FROM runs WHERE status = 'parked' ORDER BY id",
+        )?;
+        let records = statement.query_map([], read_run)?;
+        records.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub(crate) fn recoverable_runs(&self) -> Result<Vec<RunRecord>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, request_id, code_hash, input_digest, graph, status, stdout, stderr
+             FROM runs WHERE status IN ('parked', 'running') ORDER BY id",
+        )?;
+        let records = statement.query_map([], read_run)?;
+        records.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn set_status(&mut self, id: &str, status: &str) -> Result<(), JournalError> {
@@ -221,6 +259,102 @@ impl Journal {
         Ok(())
     }
 
+    /// Persist a wait. Only finalization publishes a quiescent parked run;
+    /// JavaScript may still have work to register after creating this wait.
+    pub fn park_wait(
+        &mut self,
+        run_id: &str,
+        seq: u64,
+        kind: &str,
+        wake_at: Option<i64>,
+        details: &str,
+    ) -> Result<WaitRecord, JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored_seq = sequence(seq)?;
+        let state: String = transaction.query_row(
+            "SELECT state FROM operations WHERE run_id = ?1 AND seq = ?2",
+            params![run_id, stored_seq],
+            |row| row.get(0),
+        )?;
+        if state != "pending" {
+            return Err(JournalError(format!(
+                "journal: cannot park completed operation {seq}"
+            )));
+        }
+        let existing = transaction.query_row(
+            "SELECT run_id, seq, kind, wake_at, answer, details FROM waits WHERE run_id = ?1 AND seq = ?2",
+            params![run_id, stored_seq],
+            read_wait,
+        ).optional()?;
+        let record = if let Some(existing) = existing {
+            if existing.kind != kind || existing.wake_at != wake_at || existing.details != details {
+                return Err(JournalError(format!(
+                    "journal: wait mismatch at operation {seq}"
+                )));
+            }
+            existing
+        } else {
+            transaction.execute(
+                "INSERT INTO waits (run_id, seq, kind, wake_at, details) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![run_id, stored_seq, kind, wake_at, details],
+            )?;
+            WaitRecord {
+                run_id: run_id.into(),
+                seq,
+                kind: kind.into(),
+                wake_at,
+                answer: None,
+                details: details.into(),
+            }
+        };
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn waits(&self, run_id: &str) -> Result<Vec<WaitRecord>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, seq, kind, wake_at, answer, details FROM waits WHERE run_id = ?1 ORDER BY seq",
+        )?;
+        let records = statement.query_map([run_id], read_wait)?;
+        records.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Record the first answer. Repeating it is harmless; replacing it is rejected.
+    pub fn answer_wait(
+        &mut self,
+        run_id: &str,
+        seq: u64,
+        answer: &str,
+    ) -> Result<bool, JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seq = sequence(seq)?;
+        let existing: Option<String> = transaction.query_row(
+            "SELECT answer FROM waits WHERE run_id = ?1 AND seq = ?2",
+            params![run_id, seq],
+            |row| row.get(0),
+        )?;
+        let changed = if let Some(existing) = existing {
+            if existing != answer {
+                return Err(JournalError(format!(
+                    "journal: conflicting answer at operation {seq}"
+                )));
+            }
+            false
+        } else {
+            transaction.execute(
+                "UPDATE waits SET answer = ?3 WHERE run_id = ?1 AND seq = ?2",
+                params![run_id, seq, answer],
+            )?;
+            true
+        };
+        transaction.commit()?;
+        Ok(changed)
+    }
+
     pub fn operations(&self, run_id: &str) -> Result<Vec<OpRecord>, JournalError> {
         let mut statement = self.connection.prepare(
             "SELECT seq, name, args_digest, policy, state, result, completion_order
@@ -239,6 +373,17 @@ impl Journal {
         })?;
         records.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+}
+
+fn read_wait(row: &rusqlite::Row<'_>) -> rusqlite::Result<WaitRecord> {
+    Ok(WaitRecord {
+        run_id: row.get(0)?,
+        seq: row.get(1)?,
+        kind: row.get(2)?,
+        wake_at: row.get(3)?,
+        answer: row.get(4)?,
+        details: row.get(5)?,
+    })
 }
 
 fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
@@ -500,6 +645,72 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(1), Some(2), Some(0)]
         );
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parked_waits_and_first_answers_survive_restart() {
+        let path = temporary_path();
+        {
+            let mut journal = Journal::open(&path).unwrap();
+            create(&mut journal);
+            journal.intents("run", &[intent(0), intent(1)]).unwrap();
+            let approval = journal
+                .park_wait("run", 0, "approval", None, "send email")
+                .unwrap();
+            assert_eq!(
+                journal
+                    .park_wait("run", 0, "approval", None, "send email")
+                    .unwrap(),
+                approval
+            );
+            journal
+                .park_wait("run", 1, "timer", Some(1234), "pause")
+                .unwrap();
+            assert_eq!(journal.get_run("run").unwrap().status, "running");
+            journal.finish_run("run", "parked", "", "").unwrap();
+            assert!(journal.answer_wait("run", 0, "yes").unwrap());
+        }
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(!journal.answer_wait("run", 0, "yes").unwrap());
+        assert!(journal.answer_wait("run", 0, "no").is_err());
+        let waits = journal.waits("run").unwrap();
+        assert_eq!(waits.len(), 2);
+        assert_eq!(waits[0].answer.as_deref(), Some("yes"));
+        assert_eq!(waits[0].details, "send email");
+        assert!(journal
+            .park_wait("run", 0, "approval", None, "delete file")
+            .is_err());
+        assert_eq!(journal.parked_runs().unwrap().len(), 1);
+        journal.set_status("run", "running").unwrap();
+        assert!(journal.parked_runs().unwrap().is_empty());
+        assert_eq!(waits[1].wake_at, Some(1234));
+        assert_eq!(waits[1].answer, None);
+        assert!(journal
+            .park_wait("run", 1, "timer", Some(5678), "pause")
+            .is_err());
+        assert_eq!(journal.waits("run").unwrap()[1].wake_at, Some(1234));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn only_pending_operations_can_park() {
+        let path = temporary_path();
+        let mut journal = Journal::open(&path).unwrap();
+        create(&mut journal);
+        assert!(journal
+            .park_wait("run", 0, "approval", None, "send email")
+            .is_err());
+        assert_eq!(journal.get_run("run").unwrap().status, "running");
+        journal.intents("run", &[intent(0)]).unwrap();
+        journal.complete("run", 0, "done").unwrap();
+        assert!(journal
+            .park_wait("run", 0, "approval", None, "send email")
+            .is_err());
+        assert!(journal.waits("run").unwrap().is_empty());
+        assert!(journal.answer_wait("run", 0, "missing").is_err());
         drop(journal);
         std::fs::remove_file(path).unwrap();
     }

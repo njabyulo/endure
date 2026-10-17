@@ -111,12 +111,27 @@ pub fn replay_run(
     run_id: &str,
     replacement: Option<&modules::ModuleGraph>,
 ) -> Result<RunOutput, HostError> {
-    let (recorded, policy, mut session) =
+    let (recorded, policy, session) =
         Session::resume(journal, run_id).map_err(|message| HostError {
             filename: run_id.into(),
             message,
             output: RunOutput::default(),
         })?;
+    replay_session(recorded, policy, session, replacement)
+}
+
+pub(crate) fn replay_session(
+    recorded: modules::ModuleGraph,
+    policy: Policy,
+    mut session: Session,
+    replacement: Option<&modules::ModuleGraph>,
+) -> Result<RunOutput, HostError> {
+    let run_id = session.run_id.clone();
+    let parked = session.journal.get_run(&run_id).map_err(|e| HostError {
+        filename: run_id.clone(),
+        message: e.to_string(),
+        output: RunOutput::default(),
+    })?;
     let graph = replacement.unwrap_or(&recorded);
     graph.verify_integrity().map_err(|error| HostError {
         filename: error.filename,
@@ -130,12 +145,26 @@ pub fn replay_run(
             output: RunOutput::default(),
         });
     }
+    if parked.status == "parked"
+        && crate::core::durability::can_remain_parked(&session.journal, &run_id).map_err(
+            |message| HostError {
+                filename: run_id.clone(),
+                message,
+                output: RunOutput::default(),
+            },
+        )?
+    {
+        return Ok(RunOutput {
+            stdout: parked.stdout,
+            stderr: parked.stderr,
+        });
+    }
     if !session.is_sealed() {
         session
             .journal
-            .set_status(run_id, "running")
+            .set_status(&run_id, "running")
             .map_err(|error| HostError {
-                filename: run_id.into(),
+                filename: run_id.clone(),
                 message: error.to_string(),
                 output: RunOutput::default(),
             })?;
@@ -146,6 +175,66 @@ pub fn replay_run(
         Program::Module(graph),
         Some(session),
     )
+}
+
+/// Start or rejoin a request. The same request ID cannot change code, policy,
+/// or JSON input, and concurrent executors cannot own the same request/run.
+pub fn run_request(
+    policy: &Policy,
+    graph: &modules::ModuleGraph,
+    path: &std::path::Path,
+    request_id: &str,
+    input: &str,
+) -> Result<crate::RunRecord, HostError> {
+    let fail = |message: String| HostError {
+        filename: graph.filename.clone(),
+        message,
+        output: RunOutput::default(),
+    };
+    graph.verify_integrity().map_err(|e| fail(e.to_string()))?;
+    let input: serde_json::Value = serde_json::from_str(input).map_err(|e| fail(e.to_string()))?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| fail(e.to_string()))?;
+    }
+    let journal = crate::Journal::open(path).map_err(|e| fail(e.to_string()))?;
+    let _request_lease =
+        crate::core::parking::RunLease::acquire(path, &format!("request:{request_id}"))
+            .map_err(fail)?;
+    let identity =
+        crate::core::durability::digest(&serde_json::json!({"net": policy.net, "input": input}));
+    if let Some(run) = journal
+        .find_request(request_id)
+        .map_err(|e| fail(e.to_string()))?
+    {
+        if run.code_hash != graph.code_hash() || run.input_digest != identity {
+            return Err(fail(
+                "request ID conflicts with different code, policy, or input".into(),
+            ));
+        }
+        if run.status == "parked"
+            && crate::core::durability::can_remain_parked(&journal, &run.id).map_err(fail)?
+        {
+            return Ok(run);
+        }
+        if matches!(run.status.as_str(), "done" | "failed") {
+            return Ok(run);
+        }
+        if run.status == "diverged" {
+            return Err(fail("request run has diverged".into()));
+        }
+        replay_run(path, &run.id, Some(graph))?;
+        return journal.get_run(&run.id).map_err(|e| fail(e.to_string()));
+    }
+    let id = crate::new_run_id();
+    let session =
+        Session::create_request(path, &id, policy, graph, Some(request_id), input).map_err(fail)?;
+    execute(
+        policy,
+        &graph.filename,
+        Program::Module(graph),
+        Some(session),
+    )?;
+    journal.get_run(&id).map_err(|e| fail(e.to_string()))
 }
 
 #[derive(Clone, Copy)]
@@ -230,6 +319,7 @@ fn run_on_thread(
                 .is_some()
             {
                 crate::capabilities::determinism::install(scope)
+                    .and_then(|()| crate::capabilities::agent::install(scope))
             } else {
                 Ok(())
             };

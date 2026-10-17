@@ -1,7 +1,7 @@
 //! Per-run operation boundary: durable intent before dispatch, result before JS.
 
 use super::{
-    journal::{Journal, OpIntent, OpRecord},
+    journal::{Journal, OpIntent, OpRecord, WaitRecord},
     modules::ModuleGraph,
     parking::RunLease,
 };
@@ -30,6 +30,8 @@ pub(crate) struct Session {
     pending: BTreeMap<u32, u64>,
     intents: Vec<OpIntent>,
     last_flush: Instant,
+    pub(crate) input: Value,
+    waits: BTreeMap<u32, WaitRecord>,
 }
 
 impl Session {
@@ -39,19 +41,34 @@ impl Session {
         policy: &Policy,
         graph: &ModuleGraph,
     ) -> Result<Self, String> {
+        Self::create_request(path, id, policy, graph, None, Value::Null)
+    }
+
+    pub(crate) fn create_request(
+        path: &Path,
+        id: &str,
+        policy: &Policy,
+        graph: &ModuleGraph,
+        request_id: Option<&str>,
+        input: Value,
+    ) -> Result<Self, String> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let mut journal = Journal::open(path).map_err(|e| e.to_string())?;
         let lease = RunLease::acquire(path, &format!("run:{id}"))?;
-        let snapshot = serde_json::json!({"graph": graph, "net": policy.net});
-        let input = serde_json::json!({"net": policy.net});
+        let mut journal = Journal::open(path).map_err(|e| e.to_string())?;
+        let snapshot = serde_json::json!({"graph": graph, "net": policy.net, "input": input});
+        let identity = if request_id.is_some() {
+            serde_json::json!({"net": policy.net, "input": input})
+        } else {
+            serde_json::json!({"net": policy.net})
+        };
         journal
             .create_run(
                 id,
-                None,
+                request_id,
                 graph.code_hash(),
-                &digest(&input),
+                &digest(&identity),
                 &snapshot.to_string(),
             )
             .map_err(|e| e.to_string())?;
@@ -67,12 +84,22 @@ impl Session {
             pending: BTreeMap::new(),
             intents: Vec::new(),
             last_flush: Instant::now(),
+            input,
+            waits: BTreeMap::new(),
         })
     }
 
     pub(crate) fn resume(path: &Path, id: &str) -> Result<(ModuleGraph, Policy, Self), String> {
-        let journal = Journal::open(path).map_err(|e| e.to_string())?;
         let lease = RunLease::acquire(path, &format!("run:{id}"))?;
+        Self::resume_with_lease(path, id, lease)
+    }
+
+    pub(crate) fn resume_with_lease(
+        path: &Path,
+        id: &str,
+        lease: RunLease,
+    ) -> Result<(ModuleGraph, Policy, Self), String> {
+        let journal = Journal::open(path).map_err(|e| e.to_string())?;
         let record = journal.get_run(id).map_err(|e| e.to_string())?;
         let snapshot: Value = serde_json::from_str(&record.graph).map_err(|e| e.to_string())?;
         let graph: ModuleGraph =
@@ -103,6 +130,8 @@ impl Session {
             pending: BTreeMap::new(),
             intents: Vec::new(),
             last_flush: Instant::now(),
+            input: snapshot.get("input").cloned().unwrap_or(Value::Null),
+            waits: BTreeMap::new(),
         };
         Ok((graph, policy, session))
     }
@@ -227,6 +256,65 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn register_wait(
+        &mut self,
+        id: u32,
+        kind: &str,
+        args: &Value,
+        wake_at: Option<i64>,
+    ) -> Result<(), String> {
+        self.register(
+            id,
+            if kind == "approval" {
+                "wait.approval"
+            } else {
+                "wait.timer"
+            },
+            args,
+            "safe",
+        )?;
+        if self.is_cached(id) {
+            return Ok(());
+        }
+        self.flush()?;
+        let seq = self.pending[&id];
+        let wait = self
+            .journal
+            .park_wait(&self.run_id, seq, kind, wake_at, &args.to_string())
+            .map_err(|e| e.to_string())?;
+        self.waits.insert(id, wait);
+        Ok(())
+    }
+
+    pub(crate) fn ready_wait(&mut self) -> Result<Option<(u32, Value)>, String> {
+        let now = epoch_millis()?;
+        let ready = self
+            .waits
+            .iter()
+            .find(|(_, wait)| wait.answer.is_some() || wait.wake_at.is_some_and(|at| at <= now));
+        let Some((&id, wait)) = ready else {
+            return Ok(None);
+        };
+        let value = if wait.kind == "timer" {
+            self.journal
+                .answer_wait(&self.run_id, wait.seq, "null")
+                .map_err(|e| e.to_string())?;
+            Value::Null
+        } else {
+            serde_json::from_str(wait.answer.as_deref().ok_or("approval answer missing")?)
+                .map_err(|e| e.to_string())?
+        };
+        Ok(Some((id, serde_json::json!({"Ok": value}))))
+    }
+
+    pub(crate) fn next_wake(&self) -> Option<i64> {
+        self.waits.values().filter_map(|wait| wait.wake_at).min()
+    }
+
+    pub(crate) fn should_park(&self) -> bool {
+        !self.waits.is_empty()
+    }
+
     pub(crate) fn flush(&mut self) -> Result<(), String> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
@@ -243,6 +331,7 @@ impl Session {
 
     pub(crate) fn complete(&mut self, id: u32, result: &Value) -> Result<(), String> {
         self.flush()?;
+        self.waits.remove(&id);
         let seq = self
             .pending
             .remove(&id)
@@ -297,7 +386,14 @@ impl Session {
     }
 
     pub(crate) fn finish(&mut self, status: &str, output: &RunOutput) -> Result<(), String> {
-        if status == "done" && (self.next_seq < self.history.len() as u64 || self.has_history()) {
+        let status = if status == "done" && self.should_park() {
+            "parked"
+        } else {
+            status
+        };
+        if matches!(status, "done" | "parked")
+            && (self.next_seq < self.history.len() as u64 || self.has_history())
+        {
             self.failure =
                 Some("replay divergence: execution ended before recorded history".into());
         }
@@ -327,7 +423,177 @@ pub fn new_run_id() -> String {
 /// Inspect durable operation records without executing the run.
 pub fn journal_log(path: &Path, run_id: &str) -> Result<String, String> {
     let journal = Journal::open(path).map_err(|e| e.to_string())?;
-    journal.get_run(run_id).map_err(|e| e.to_string())?;
-    serde_json::to_string_pretty(&journal.operations(run_id).map_err(|e| e.to_string())?)
+    let run = journal.get_run(run_id).map_err(|e| e.to_string())?;
+    let ops = journal.operations(run_id).map_err(|e| e.to_string())?;
+    let waits = journal.waits(run_id).map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&serde_json::json!({"id": run.id, "status": run.status, "request_id": run.request_id, "code_hash": run.code_hash, "operations": ops, "waits": waits}))
         .map_err(|e| e.to_string())
+}
+
+pub(crate) fn epoch_millis() -> Result<i64, String> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?;
+    i64::try_from(elapsed.as_millis()).map_err(|_| "wall clock exceeds supported range".into())
+}
+
+pub(crate) fn wait_ready(wait: &WaitRecord, now: i64) -> bool {
+    wait.answer.is_some() || wait.wake_at.is_some_and(|at| at <= now)
+}
+
+pub(crate) fn can_remain_parked(journal: &Journal, run_id: &str) -> Result<bool, String> {
+    let now = epoch_millis()?;
+    let pending: Vec<_> = journal
+        .operations(run_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|op| op.state == "pending")
+        .collect();
+    let waits = journal.waits(run_id).map_err(|e| e.to_string())?;
+    Ok(!pending.is_empty()
+        && pending.iter().all(|op| {
+            waits
+                .iter()
+                .find(|wait| wait.seq == op.seq)
+                .is_some_and(|wait| !wait_ready(wait, now))
+        }))
+}
+
+/// Answer an approval once, then wake the run using its persisted snapshot.
+pub fn approve_run(
+    path: &Path,
+    run_id: &str,
+    seq: u64,
+    answer: bool,
+) -> Result<RunOutput, crate::HostError> {
+    let record_answer = || -> Result<(), String> {
+        let _lease = RunLease::acquire(path, &format!("run:{run_id}"))?;
+        let mut journal = Journal::open(path).map_err(|e| e.to_string())?;
+        let wait = journal
+            .waits(run_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|w| w.seq == seq)
+            .ok_or("unknown approval wait")?;
+        if wait.kind != "approval" {
+            return Err("wait is not an approval".into());
+        }
+        journal
+            .answer_wait(run_id, seq, if answer { "true" } else { "false" })
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    };
+    record_answer().map_err(|message| crate::HostError {
+        filename: run_id.into(),
+        message,
+        output: RunOutput::default(),
+    })?;
+    crate::replay_run(path, run_id, None)
+}
+
+/// Result of attempting one ready run. A failed run does not stop the batch.
+#[derive(Debug)]
+pub struct WakeOutcome {
+    pub run_id: String,
+    pub result: Result<super::journal::RunRecord, crate::HostError>,
+}
+
+/// Recover abandoned runs and wake ready waits, skipping runs with live owners.
+pub fn wake_ready(path: &Path) -> Result<Vec<WakeOutcome>, crate::HostError> {
+    let fail = |message| crate::HostError {
+        filename: path.display().to_string(),
+        message,
+        output: RunOutput::default(),
+    };
+    let journal = Journal::open(path).map_err(|e| fail(e.to_string()))?;
+    let mut awakened = Vec::new();
+    for run in journal
+        .recoverable_runs()
+        .map_err(|e| fail(e.to_string()))?
+    {
+        let result = match wake_run(path, &journal, &run.id) {
+            Ok(None) => continue,
+            Ok(Some(run)) => Ok(run),
+            Err(error) => Err(error),
+        };
+        awakened.push(WakeOutcome {
+            run_id: run.id,
+            result,
+        });
+    }
+    Ok(awakened)
+}
+
+fn wake_run(
+    path: &Path,
+    journal: &Journal,
+    run_id: &str,
+) -> Result<Option<super::journal::RunRecord>, crate::HostError> {
+    let fail = |message| crate::HostError {
+        filename: run_id.into(),
+        message,
+        output: RunOutput::default(),
+    };
+    let Some(lease) = RunLease::try_acquire(path, &format!("run:{run_id}")).map_err(fail)? else {
+        return Ok(None);
+    };
+    // The scan is only a hint: another owner may have finished since it ran.
+    let current = journal.get_run(run_id).map_err(|e| fail(e.to_string()))?;
+    if !matches!(current.status.as_str(), "parked" | "running") {
+        return Ok(None);
+    }
+    if current.status == "parked" && can_remain_parked(journal, run_id).map_err(fail)? {
+        return Ok(None);
+    }
+    let (graph, policy, session) = Session::resume_with_lease(path, run_id, lease).map_err(fail)?;
+    crate::host::replay_session(graph, policy, session, None)?;
+    journal
+        .get_run(run_id)
+        .map(Some)
+        .map_err(|e| fail(e.to_string()))
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn stale_candidates_are_checked_again_after_claiming_the_lease() {
+        let directory = std::env::temp_dir().join(format!("ondure-wake-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("journal.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        // Invalid snapshots deliberately prove terminal candidates are never replayed.
+        for status in ["done", "failed", "diverged"] {
+            journal
+                .create_run(status, None, "hash", "input", "{}")
+                .unwrap();
+            assert!(journal
+                .recoverable_runs()
+                .unwrap()
+                .iter()
+                .any(|run| run.id == status));
+            journal.finish_run(status, status, "saved", "").unwrap();
+            assert!(wake_run(&path, &journal, status).unwrap().is_none());
+            assert_eq!(journal.get_run(status).unwrap().status, status);
+        }
+        drop(journal);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn live_owners_are_skipped_without_batch_errors() {
+        let directory = std::env::temp_dir().join(format!("ondure-wake-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("journal.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        journal
+            .create_run("live", None, "hash", "input", "{}")
+            .unwrap();
+        let lease = RunLease::acquire(&path, "run:live").unwrap();
+        assert!(wake_ready(&path).unwrap().is_empty());
+        assert_eq!(journal.get_run("live").unwrap().status, "running");
+        drop((journal, lease));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -18,6 +18,7 @@ pub(crate) struct Operations {
     next_id: OperationId,
     queued: Vec<(OperationId, String)>,
     fetches: BTreeMap<OperationId, v8::Global<v8::PromiseResolver>>,
+    waits: BTreeMap<OperationId, v8::Global<v8::PromiseResolver>>,
     timers: BTreeMap<OperationId, Timer>,
     deadlines: BTreeSet<(Instant, OperationId)>,
 }
@@ -33,7 +34,9 @@ impl Operations {
         // Never reuse a live ID, even after the counter wraps.
         loop {
             self.next_id = self.next_id.wrapping_add(1).max(1);
-            if !self.fetches.contains_key(&self.next_id) && !self.timers.contains_key(&self.next_id)
+            if !self.fetches.contains_key(&self.next_id)
+                && !self.timers.contains_key(&self.next_id)
+                && !self.waits.contains_key(&self.next_id)
             {
                 return self.next_id;
             }
@@ -84,6 +87,20 @@ impl Operations {
         Ok(id)
     }
 
+    pub(crate) fn wait(
+        &mut self,
+        resolver: v8::Global<v8::PromiseResolver>,
+        kind: &str,
+        args: &serde_json::Value,
+        wake_at: Option<i64>,
+        session: &mut super::durability::Session,
+    ) -> Result<(), String> {
+        let id = self.id();
+        session.register_wait(id, kind, args, wake_at)?;
+        self.waits.insert(id, resolver);
+        Ok(())
+    }
+
     pub(crate) fn cancel_timer(
         &mut self,
         id: OperationId,
@@ -114,11 +131,14 @@ type HttpResult = (OperationId, Result<(u16, String), String>);
 enum Completion {
     Http(HttpResult),
     Timer(OperationId),
+    Wait((OperationId, serde_json::Value)),
+    PollWaits,
 }
 
 async fn next_completion(
     tasks: &mut JoinSet<HttpResult>,
     timer: Option<(OperationId, Instant)>,
+    wake: Option<Duration>,
 ) -> Completion {
     let timer_ready = async {
         match timer {
@@ -129,12 +149,19 @@ async fn next_completion(
             None => std::future::pending().await,
         }
     };
+    let wait_ready = async {
+        match wake {
+            Some(delay) => tokio::time::sleep(delay).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         result = tasks.join_next(), if !tasks.is_empty() => {
             // The wrapper task only awaits a worker and constructs owned data.
             Completion::Http(result.expect("active HTTP task").expect("HTTP wrapper task"))
         }
         id = timer_ready => Completion::Timer(id),
+        () = wait_ready => Completion::PollWaits,
     }
 }
 
@@ -246,10 +273,37 @@ pub(crate) fn run(
                     serde_json::from_value(result).map_err(|e| e.to_string())?,
                 )))
             } else {
-                Some(Completion::Timer(id))
+                let is_wait = scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .operations
+                    .borrow()
+                    .waits
+                    .contains_key(&id);
+                if is_wait {
+                    Some(Completion::Wait((id, result)))
+                } else {
+                    Some(Completion::Timer(id))
+                }
             }
         } else {
             None
+        };
+        let cached = if cached.is_some() {
+            cached
+        } else {
+            let ready = if let Some(session) = scope
+                .get_slot::<HostState>()
+                .expect("host state installed")
+                .session
+                .borrow_mut()
+                .as_mut()
+            {
+                session.ready_wait()?
+            } else {
+                None
+            };
+            ready.map(Completion::Wait)
         };
         if tasks.is_empty() && timer.is_none() && cached.is_none() {
             // Rejection stringification can itself run JS and enqueue work.
@@ -267,6 +321,16 @@ pub(crate) fn run(
             let ops = state.operations.borrow();
             if ops.queued.is_empty() && ops.timers.is_empty() {
                 drop(ops);
+                let parked = scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .session
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|session| session.should_park());
+                if failure.is_none() && parked {
+                    break;
+                }
                 if let Some(evaluation) = evaluation {
                     let promise = v8::Local::new(scope, evaluation);
                     if promise.state() == v8::PromiseState::Pending {
@@ -279,13 +343,29 @@ pub(crate) fn run(
             }
             continue;
         }
+        let wake = scope
+            .get_slot::<HostState>()
+            .expect("host state installed")
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|session| session.next_wake())
+            .map(|at| {
+                super::durability::epoch_millis()
+                    .map(|now| Duration::from_millis(at.saturating_sub(now).max(0) as u64))
+            })
+            .transpose()?;
         let completion = match cached {
             Some(completion) => completion,
-            None => runtime.block_on(next_completion(&mut tasks, timer)),
+            None => runtime.block_on(next_completion(&mut tasks, timer, wake)),
         };
+        if matches!(completion, Completion::PollWaits) {
+            continue;
+        }
         v8::scope!(let scope, scope);
         v8::tc_scope!(let scope, scope);
         match completion {
+            Completion::PollWaits => unreachable!(),
             Completion::Http((id, result)) => {
                 if let Some(session) = scope
                     .get_slot::<HostState>()
@@ -309,6 +389,42 @@ pub(crate) fn run(
                     .expect("pending fetch");
                 let resolver = v8::Local::new(scope, &retained);
                 networking::complete(scope, resolver, result);
+            }
+            Completion::Wait((id, result)) => {
+                if let Some(session) = scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .session
+                    .borrow_mut()
+                    .as_mut()
+                {
+                    session.complete(id, &result)?;
+                }
+                let retained = scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .operations
+                    .borrow_mut()
+                    .waits
+                    .remove(&id)
+                    .ok_or("pending wait missing")?;
+                let resolver = v8::Local::new(scope, &retained);
+                let decoded: Result<serde_json::Value, String> =
+                    serde_json::from_value(result).map_err(|e| e.to_string())?;
+                match decoded {
+                    Ok(value) => {
+                        let text = v8::String::new(scope, &value.to_string())
+                            .ok_or("wait result exceeds V8 limit")?;
+                        let value = v8::json::parse(scope, text).ok_or("invalid wait result")?;
+                        resolver.resolve(scope, value);
+                    }
+                    Err(error) => {
+                        let message =
+                            v8::String::new(scope, &error).ok_or("wait error exceeds V8 limit")?;
+                        let error = v8::Exception::error(scope, message);
+                        resolver.reject(scope, error);
+                    }
+                }
             }
             Completion::Timer(id) => {
                 if let Some(session) = scope

@@ -232,3 +232,39 @@ APIs such as workers and external entropy sources remain unavailable.
 
 Journal JSON uses round-trip float parsing so recorded random/performance values
 return identical floating-point values rather than nearby approximations.
+
+
+## Parking and request identity
+
+Durable modules can suspend without keeping an isolate or process alive:
+
+```js
+const accepted = await ondure.approve({ action: "continue" });
+if (accepted) console.log("approved");
+await ondure.sleepUntil(Date.now() + 60_000);
+console.log("awake");
+```
+
+`ondure.approve` stores JSON details and a pending approval. `ondure.sleepUntil`
+stores an absolute epoch-millisecond deadline. Both release the isolate when
+there is no other live work. Regular `setTimeout` remains an in-process timer.
+
+```sh
+./build/ondure run examples/approval.ts --run-id approval
+./build/ondure log approval
+# Use the approval wait's seq from the log:
+./build/ondure approve approval 0 yes
+./build/ondure wake
+```
+
+Approval answers commit before resumption. Repeating an identical answer is
+idempotent; changing an answer fails. `wake` resumes ready parked runs from their
+captured graph. Invoke it from an external scheduler; Ondure does not run a
+background daemon. Console output is reconstructed on resumption.
+
+`run ... --request ID --input '{"name":"reader"}'` binds a request ID to its
+code hash, policy, and JSON input. JavaScript reads the input as `ondure.input`.
+Retries return the same run and cached terminal output; changed identity fails.
+OS file locks prevent concurrent owners of the same request or run and release
+on process death. Journal and lease files must share local storage; this is not
+a distributed executor or an exactly-once guarantee for external effects.
