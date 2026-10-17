@@ -190,7 +190,9 @@ fn wake_recovers_a_killed_resumption_without_repeating_completed_http() {
     journal.answer_wait("recover", seq, "true").unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_ondure"))
         .current_dir(&project.0)
-        .args(["replay", "recover"])
+        // Kill the execution owner itself; public-supervisor death is tested
+        // separately in supervisor_lifecycle.rs.
+        .args(["__worker", "replay", "recover"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

@@ -190,3 +190,21 @@ fn console_output_limit_bounds_retained_logs_and_preserves_the_journal() {
     assert_eq!(failed.stdout.len(), runtime::MAX_OUTPUT_BYTES);
     project.assert_healthy_followup();
 }
+
+#[test]
+fn scheduler_recovery_preserves_the_requested_execution_budget() {
+    let project = Project::new("await ondure.approve({action:'loop'}); while(true) {}");
+    assert!(project
+        .run(&["run", "agent.ts", "--run-id", "wake-limit"])
+        .status
+        .success());
+    let mut journal = project.journal();
+    let seq = journal.waits("wake-limit").unwrap()[0].seq;
+    journal.answer_wait("wake-limit", seq, "true").unwrap();
+    let started = Instant::now();
+    let output = project.run(&["wake", "--cpu-ms", "50"]);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("execution time limit exceeded"));
+    assert_eq!(journal.get_run("wake-limit").unwrap().status, "failed");
+}
