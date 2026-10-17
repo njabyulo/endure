@@ -185,7 +185,34 @@ pub(crate) fn run(
             let mut ops = state.operations.borrow_mut();
             (std::mem::take(&mut ops.queued), ops.next_timer())
         };
+        let historical = scope
+            .get_slot::<HostState>()
+            .expect("host state installed")
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| session.has_history());
         for (id, url) in queued {
+            let cached = scope
+                .get_slot::<HostState>()
+                .expect("host state installed")
+                .session
+                .borrow()
+                .as_ref()
+                .is_some_and(|session| session.is_cached(id));
+            if cached {
+                continue;
+            }
+            if historical {
+                scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .operations
+                    .borrow_mut()
+                    .queued
+                    .push((id, url));
+                continue;
+            }
             let _entered = runtime.enter();
             tasks.spawn(async move {
                 let result = tokio::task::spawn_blocking(move || networking::http_get(&url))
@@ -194,7 +221,37 @@ pub(crate) fn run(
                 (id, result)
             });
         }
-        if tasks.is_empty() && timer.is_none() {
+        let cached = if let Some(session) = scope
+            .get_slot::<HostState>()
+            .expect("host state installed")
+            .session
+            .borrow_mut()
+            .as_mut()
+        {
+            session.next_cached()?
+        } else {
+            None
+        };
+        let cached = if let Some((id, result)) = cached {
+            if scope
+                .get_slot::<HostState>()
+                .expect("host state installed")
+                .operations
+                .borrow()
+                .fetches
+                .contains_key(&id)
+            {
+                Some(Completion::Http((
+                    id,
+                    serde_json::from_value(result).map_err(|e| e.to_string())?,
+                )))
+            } else {
+                Some(Completion::Timer(id))
+            }
+        } else {
+            None
+        };
+        if tasks.is_empty() && timer.is_none() && cached.is_none() {
             // Rejection stringification can itself run JS and enqueue work.
             let rejection = super::microtasks::take_unhandled_rejection(scope);
             if let Some(message) = rejection {
@@ -204,6 +261,9 @@ pub(crate) fn run(
                 continue;
             }
             let state = scope.get_slot::<HostState>().expect("host state installed");
+            if let Some(session) = state.session.borrow_mut().as_mut() {
+                session.check_idle()?;
+            }
             let ops = state.operations.borrow();
             if ops.queued.is_empty() && ops.timers.is_empty() {
                 drop(ops);
@@ -219,7 +279,10 @@ pub(crate) fn run(
             }
             continue;
         }
-        let completion = runtime.block_on(next_completion(&mut tasks, timer));
+        let completion = match cached {
+            Some(completion) => completion,
+            None => runtime.block_on(next_completion(&mut tasks, timer)),
+        };
         v8::scope!(let scope, scope);
         v8::tc_scope!(let scope, scope);
         match completion {

@@ -1,4 +1,4 @@
-use runtime::{journal_log, new_run_id, run_durable, ModuleGraph, Policy, RunOutput};
+use runtime::{journal_log, new_run_id, replay_run, run_durable, ModuleGraph, Policy, RunOutput};
 use std::{error::Error, io::Write, path::Path, process::ExitCode};
 
 fn run() -> Result<(), Box<dyn Error>> {
@@ -6,7 +6,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let command = arguments.next();
     let target = arguments
         .next()
-        .ok_or("usage: ondure run <script> [--run-id <id>] [--journal <path>] | log <run-id>")?;
+        .ok_or("usage: ondure run <script> [--run-id <id>] [--journal <path>] | replay <run-id> | log <run-id>")?;
     let mut journal = std::path::PathBuf::from(".ondure/journal.sqlite3");
     let mut run_id = None;
     while let Some(flag) = arguments.next() {
@@ -27,10 +27,25 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
             return Ok(());
         }
+        Some("replay") => {
+            let output = match replay_run(
+                &journal,
+                target.to_str().ok_or("run ID must be UTF-8")?,
+                None,
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    write_output(&error.output)?;
+                    return Err(error.into());
+                }
+            };
+            write_output(&output)?;
+            return Ok(());
+        }
         Some("run") => {}
         _ => {
             return Err(
-                "usage: ondure run <script> [--run-id <id>] [--journal <path>] | log <run-id>"
+                "usage: ondure run <script> [--run-id <id>] [--journal <path>] | replay <run-id> | log <run-id>"
                     .into(),
             )
         }

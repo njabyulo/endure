@@ -104,6 +104,50 @@ pub fn run_durable(
     )
 }
 
+/// Re-execute captured code, supplying recorded results in their original order.
+/// Unfinished safe operations may run live; completed effects are never reissued.
+pub fn replay_run(
+    journal: &std::path::Path,
+    run_id: &str,
+    replacement: Option<&modules::ModuleGraph>,
+) -> Result<RunOutput, HostError> {
+    let (recorded, policy, mut session) =
+        Session::resume(journal, run_id).map_err(|message| HostError {
+            filename: run_id.into(),
+            message,
+            output: RunOutput::default(),
+        })?;
+    let graph = replacement.unwrap_or(&recorded);
+    graph.verify_integrity().map_err(|error| HostError {
+        filename: error.filename,
+        message: error.message,
+        output: RunOutput::default(),
+    })?;
+    if graph.code_hash() != recorded.code_hash() {
+        return Err(HostError {
+            filename: graph.filename.clone(),
+            message: "code hash mismatch on replay".into(),
+            output: RunOutput::default(),
+        });
+    }
+    if !session.is_sealed() {
+        session
+            .journal
+            .set_status(run_id, "running")
+            .map_err(|error| HostError {
+                filename: run_id.into(),
+                message: error.to_string(),
+                output: RunOutput::default(),
+            })?;
+    }
+    execute(
+        &policy,
+        &graph.filename,
+        Program::Module(graph),
+        Some(session),
+    )
+}
+
 #[derive(Clone, Copy)]
 enum Program<'a> {
     Script(&'a str),
