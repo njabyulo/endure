@@ -21,3 +21,5 @@ pub use host::{
 };
 
 pub use core::durability::{approve_run_with_limits, wake_ready_with_limits};
+
+pub use integrations::io::MAX_OUTPUT_BYTES;

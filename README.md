@@ -291,3 +291,18 @@ can reopen the journal and another worker can run. A native crash may leave a
 running record for replay and cannot flush in-memory console output. Process
 containment does not protect against system-wide kernel OOM. The Rust library
 alone does not contain fatal native allocation failures.
+
+
+The CLI forwards worker stdout and stderr as they arrive using fixed-size
+buffers, so generated run IDs are available while execution is still pending.
+A private liveness pipe ties the worker to the CLI parent, including abrupt
+parent termination. Stopping the public CLI stops its worker and releases the
+run lease; unfinished safe operations remain recoverable through the journal.
+
+Console output has a combined **8 MiB UTF-8 limit per execution**, including
+separators and newlines across `console.log` and `console.error`. This applies
+to Rust embedding APIs too and is exported as `MAX_OUTPUT_BYTES`. A value that
+would exceed the limit is rejected before allocating its Rust string copy;
+execution terminates with `console output limit exceeded`, preserving earlier
+captured output. The supervisor streams output without retaining another copy.
+This cap covers console retention, not every host allocation or total RSS.

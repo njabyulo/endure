@@ -206,6 +206,16 @@ fn main() -> ExitCode {
         .is_some_and(|argument| argument == "__worker")
     {
         arguments.remove(0);
+        if arguments
+            .first()
+            .is_some_and(|argument| argument == "__parent-watch")
+        {
+            arguments.remove(0);
+            if let Err(error) = supervisor::watch_parent() {
+                eprintln!("parent watcher failed: {error}");
+                return ExitCode::from(1);
+            }
+        }
         run(arguments.into_iter())
     } else {
         supervise(&arguments)
@@ -220,14 +230,12 @@ fn main() -> ExitCode {
 }
 
 fn supervise(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
-    let output = supervisor::supervise(arguments)?;
-    std::io::stdout().lock().write_all(&output.stdout)?;
-    std::io::stderr().lock().write_all(&output.stderr)?;
-    if output.status.success() {
+    let status = supervisor::supervise(arguments)?;
+    if status.success() {
         return Ok(());
     }
-    if let Some(code) = output.status.code() {
+    if let Some(code) = status.code() {
         std::process::exit(code);
     }
-    Err(format!("runtime worker terminated: {}", output.status).into())
+    Err(format!("runtime worker terminated: {}", status).into())
 }

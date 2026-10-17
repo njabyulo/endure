@@ -176,3 +176,17 @@ fn cpu_limit_exits_promptly_while_an_allowed_http_worker_is_stalled() {
         "failed"
     );
 }
+
+#[test]
+fn console_output_limit_bounds_retained_logs_and_preserves_the_journal() {
+    let project =
+        Project::new("const chunk='x'.repeat(1023); for(let i=0;i<10000;i++) console.log(chunk);");
+    let output = project.run(&["run", "agent.ts", "--run-id", "output"]);
+    assert!(!output.status.success());
+    assert_eq!(output.stdout.len(), runtime::MAX_OUTPUT_BYTES);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("console output limit exceeded"));
+    let failed = project.journal().get_run("output").unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.stdout.len(), runtime::MAX_OUTPUT_BYTES);
+    project.assert_healthy_followup();
+}

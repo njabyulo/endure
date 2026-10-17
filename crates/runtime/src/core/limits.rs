@@ -151,6 +151,18 @@ pub(crate) fn failure(isolate: &v8::Isolate) -> Option<String> {
     {
         1 => Some("execution time limit exceeded".into()),
         2 => Some("V8 heap limit exceeded".into()),
+        3 => Some("console output limit exceeded".into()),
         _ => None,
+    }
+}
+
+/// Console retention is bounded even when execution/heap budgets are disabled.
+pub(crate) fn exceed_output(isolate: &v8::Isolate) {
+    if let Some(control) = isolate.get_slot::<Arc<Control>>() {
+        control
+            .reason
+            .compare_exchange(0, 3, Ordering::SeqCst, Ordering::SeqCst)
+            .ok();
+        control.handle.terminate_execution();
     }
 }
