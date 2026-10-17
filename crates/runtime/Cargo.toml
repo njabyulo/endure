@@ -9,3 +9,4 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 v8 = "152.2.0"
 ureq = "2"
+tokio = { version = "1", features = ["rt", "time", "macros"] }

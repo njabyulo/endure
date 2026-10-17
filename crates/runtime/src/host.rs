@@ -2,11 +2,11 @@
 //!
 //! Policy and buffers stay in a Rust-owned isolate slot, outside JavaScript's
 //! globals. Local handles follow the visible scopes below; Global handles retain
-//! rejected promises and their reasons until final rejection inspection.
+//! pending resolvers, timer callbacks, and unhandled rejection reasons.
 
 use crate::{
-    core::{embedding, execution, microtasks},
-    integrations::{io, networking},
+    core::{embedding, event_loop, execution, microtasks},
+    integrations::{io, networking, timers},
     Policy,
 };
 use std::{cell::RefCell, fmt};
@@ -15,6 +15,7 @@ pub(crate) struct HostState {
     pub(crate) policy: Policy,
     pub(crate) stdout: RefCell<String>,
     pub(crate) stderr: RefCell<String>,
+    pub(crate) operations: RefCell<event_loop::Operations>,
     pub(crate) rejections: microtasks::PromiseRejections,
 }
 
@@ -40,40 +41,77 @@ impl fmt::Display for HostError {
 
 impl std::error::Error for HostError {}
 
+/// Execute JavaScript and wait for all submitted host operations.
+///
+/// This function blocks its caller. Inside Tokio it runs the entire isolate on
+/// a separate thread to avoid nesting executors. Async callers should use
+/// `spawn_blocking` when they need their own executor to keep making progress.
 pub fn run_source(policy: &Policy, filename: &str, source: &str) -> Result<RunOutput, HostError> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::scope(|threads| {
+            let worker = std::thread::Builder::new()
+                .name("ondure-isolate".into())
+                .spawn_scoped(threads, || run_on_thread(policy, filename, source))
+                .map_err(|error| HostError {
+                    filename: filename.into(),
+                    message: format!("isolate thread initialization failed: {error}"),
+                    output: RunOutput::default(),
+                })?;
+            worker.join().unwrap_or_else(|_| {
+                Err(HostError {
+                    filename: filename.into(),
+                    message: "isolate thread panicked".into(),
+                    output: RunOutput::default(),
+                })
+            })
+        });
+    }
+    run_on_thread(policy, filename, source)
+}
+
+// Create, execute, and dispose both V8 and Tokio on the same host thread.
+fn run_on_thread(policy: &Policy, filename: &str, source: &str) -> Result<RunOutput, HostError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|error| HostError {
+            filename: filename.into(),
+            message: format!("event loop initialization failed: {error}"),
+            output: RunOutput::default(),
+        })?;
     let mut isolate = embedding::new_isolate();
     microtasks::install(&mut isolate);
     isolate.set_slot(HostState {
         policy: *policy,
         stdout: RefCell::new(String::new()),
         stderr: RefCell::new(String::new()),
+        operations: RefCell::new(event_loop::Operations::default()),
         rejections: microtasks::PromiseRejections::default(),
     });
 
-    let result = (|| -> Result<(), String> {
+    let result = {
         v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         io::install(scope);
         networking::install(scope);
+        timers::install(scope);
 
-        v8::tc_scope!(let scope, scope);
-        execution::compile_and_run(scope, filename, source).map_err(|fallback| {
-            scope
-                .exception()
-                .map(|error| error.to_rust_string_lossy(scope))
-                .unwrap_or(fallback)
-        })?;
-
-        microtasks::drain(scope);
-        if let Some(exception) = scope.exception() {
-            return Err(exception.to_rust_string_lossy(scope));
-        }
-        if let Some(message) = microtasks::take_unhandled_rejection(scope) {
-            return Err(message);
-        }
-        Ok(())
-    })();
+        let failure = {
+            v8::tc_scope!(let scope, scope);
+            let failure = execution::compile_and_run(scope, filename, source)
+                .err()
+                .map(|fallback| {
+                    scope
+                        .exception()
+                        .map(|error| error.to_rust_string_lossy(scope))
+                        .unwrap_or(fallback)
+                });
+            scope.reset();
+            failure
+        };
+        event_loop::run(scope, &runtime, failure)
+    };
 
     let state = isolate
         .remove_slot::<HostState>()
@@ -132,5 +170,32 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.output, RunOutput::default());
         assert!(error.message.contains("SyntaxError"));
+    }
+
+    #[test]
+    fn tokio_callers_receive_output_and_errors_without_nested_runtime_panics() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let output = run_source(&Policy::default(), "sync.js", "console.log('sync');").unwrap();
+            assert_eq!(output.stdout, "sync\n");
+            let output = run_source(
+                &Policy::default(),
+                "timer.js",
+                "setTimeout(() => console.log('done'), 1);",
+            )
+            .unwrap();
+            assert_eq!(output.stdout, "done\n");
+            let error = run_source(
+                &Policy::default(),
+                "failure.js",
+                "setTimeout(() => console.log('done'), 1); throw Error('boom');",
+            )
+            .unwrap_err();
+            assert_eq!(error.message, "Error: boom");
+            assert_eq!(error.output.stdout, "done\n");
+        });
     }
 }

@@ -2,3 +2,4 @@
 
 pub(crate) mod io;
 pub(crate) mod networking;
+pub(crate) mod timers;
