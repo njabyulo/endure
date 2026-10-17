@@ -143,7 +143,10 @@ fn generated_run_ids_identify_successful_and_failed_journals() {
         );
         let log = directory.run(&["log", run_id]);
         assert!(log.status.success());
-        assert_eq!(log.stdout, b"[]\n");
+        let text = std::str::from_utf8(&log.stdout).unwrap();
+        assert!(text.contains(&format!("\"id\": \"{run_id}\"")));
+        assert!(text.contains("\"operations\": []"));
+        assert!(text.contains(&format!("\"status\": \"{}\"", record.status)));
         assert!(log.stderr.is_empty());
     }
 }
