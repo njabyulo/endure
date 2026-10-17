@@ -5,7 +5,7 @@
 //! compiled modules, pending resolvers, timer callbacks, and rejection reasons.
 
 use crate::{
-    core::{durability::Session, embedding, event_loop, execution, microtasks, modules},
+    core::{durability::Session, embedding, event_loop, execution, limits, microtasks, modules},
     integrations::{io, networking, timers},
     Policy,
 };
@@ -48,7 +48,17 @@ impl std::error::Error for HostError {}
 /// a separate thread to avoid nesting executors. Async callers should use
 /// `spawn_blocking` when they need their own executor to keep making progress.
 pub fn run_source(policy: &Policy, filename: &str, source: &str) -> Result<RunOutput, HostError> {
-    execute(policy, filename, Program::Script(source), None)
+    run_source_with_limits(policy, filename, source, limits::RunLimits::default())
+}
+
+/// Execute with explicit active-execution and V8 managed-heap limits.
+pub fn run_source_with_limits(
+    policy: &Policy,
+    filename: &str,
+    source: &str,
+    limits: limits::RunLimits,
+) -> Result<RunOutput, HostError> {
+    execute(policy, filename, Program::Script(source), None, limits)
 }
 
 /// Execute a prepared graph, optionally requiring the code hash of a prior run.
@@ -58,6 +68,16 @@ pub fn run_module(
     policy: &Policy,
     graph: &modules::ModuleGraph,
     expected_hash: Option<&str>,
+) -> Result<RunOutput, HostError> {
+    run_module_with_limits(policy, graph, expected_hash, limits::RunLimits::default())
+}
+
+/// Execute with explicit active-execution and V8 managed-heap limits.
+pub fn run_module_with_limits(
+    policy: &Policy,
+    graph: &modules::ModuleGraph,
+    expected_hash: Option<&str>,
+    limits: limits::RunLimits,
 ) -> Result<RunOutput, HostError> {
     graph.verify_integrity().map_err(|error| HostError {
         filename: error.filename,
@@ -76,7 +96,13 @@ pub fn run_module(
             });
         }
     }
-    execute(policy, &graph.filename, Program::Module(graph), None)
+    execute(
+        policy,
+        &graph.filename,
+        Program::Module(graph),
+        None,
+        limits,
+    )
 }
 
 /// Execute a fresh journaled run. Operation results commit before JS observes them.
@@ -85,6 +111,17 @@ pub fn run_durable(
     graph: &modules::ModuleGraph,
     journal: &std::path::Path,
     run_id: &str,
+) -> Result<RunOutput, HostError> {
+    run_durable_with_limits(policy, graph, journal, run_id, limits::RunLimits::default())
+}
+
+/// Execute with explicit active-execution and V8 managed-heap limits.
+pub fn run_durable_with_limits(
+    policy: &Policy,
+    graph: &modules::ModuleGraph,
+    journal: &std::path::Path,
+    run_id: &str,
+    limits: limits::RunLimits,
 ) -> Result<RunOutput, HostError> {
     graph.verify_integrity().map_err(|error| HostError {
         filename: error.filename,
@@ -101,6 +138,7 @@ pub fn run_durable(
         &graph.filename,
         Program::Module(graph),
         Some(session),
+        limits,
     )
 }
 
@@ -111,13 +149,23 @@ pub fn replay_run(
     run_id: &str,
     replacement: Option<&modules::ModuleGraph>,
 ) -> Result<RunOutput, HostError> {
+    replay_run_with_limits(journal, run_id, replacement, limits::RunLimits::default())
+}
+
+/// Execute with explicit active-execution and V8 managed-heap limits.
+pub fn replay_run_with_limits(
+    journal: &std::path::Path,
+    run_id: &str,
+    replacement: Option<&modules::ModuleGraph>,
+    limits: limits::RunLimits,
+) -> Result<RunOutput, HostError> {
     let (recorded, policy, session) =
         Session::resume(journal, run_id).map_err(|message| HostError {
             filename: run_id.into(),
             message,
             output: RunOutput::default(),
         })?;
-    replay_session(recorded, policy, session, replacement)
+    replay_session(recorded, policy, session, replacement, limits)
 }
 
 pub(crate) fn replay_session(
@@ -125,6 +173,7 @@ pub(crate) fn replay_session(
     policy: Policy,
     mut session: Session,
     replacement: Option<&modules::ModuleGraph>,
+    limits: limits::RunLimits,
 ) -> Result<RunOutput, HostError> {
     let run_id = session.run_id.clone();
     let parked = session.journal.get_run(&run_id).map_err(|e| HostError {
@@ -174,6 +223,7 @@ pub(crate) fn replay_session(
         &graph.filename,
         Program::Module(graph),
         Some(session),
+        limits,
     )
 }
 
@@ -185,6 +235,25 @@ pub fn run_request(
     path: &std::path::Path,
     request_id: &str,
     input: &str,
+) -> Result<crate::RunRecord, HostError> {
+    run_request_with_limits(
+        policy,
+        graph,
+        path,
+        request_id,
+        input,
+        limits::RunLimits::default(),
+    )
+}
+
+/// Execute with explicit active-execution and V8 managed-heap limits.
+pub fn run_request_with_limits(
+    policy: &Policy,
+    graph: &modules::ModuleGraph,
+    path: &std::path::Path,
+    request_id: &str,
+    input: &str,
+    limits: limits::RunLimits,
 ) -> Result<crate::RunRecord, HostError> {
     let fail = |message: String| HostError {
         filename: graph.filename.clone(),
@@ -222,7 +291,7 @@ pub fn run_request(
         if run.status == "diverged" {
             return Err(fail("request run has diverged".into()));
         }
-        replay_run(path, &run.id, Some(graph))?;
+        replay_run_with_limits(path, &run.id, Some(graph), limits)?;
         return journal.get_run(&run.id).map_err(|e| fail(e.to_string()));
     }
     let id = crate::new_run_id();
@@ -233,6 +302,7 @@ pub fn run_request(
         &graph.filename,
         Program::Module(graph),
         Some(session),
+        limits,
     )?;
     journal.get_run(&id).map_err(|e| fail(e.to_string()))
 }
@@ -248,13 +318,14 @@ fn execute(
     filename: &str,
     program: Program<'_>,
     session: Option<Session>,
+    limits: limits::RunLimits,
 ) -> Result<RunOutput, HostError> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return std::thread::scope(|threads| {
             let worker = std::thread::Builder::new()
                 .name("ondure-isolate".into())
                 .spawn_scoped(threads, || {
-                    run_on_thread(policy, filename, program, session)
+                    run_on_thread(policy, filename, program, session, limits)
                 })
                 .map_err(|error| HostError {
                     filename: filename.into(),
@@ -270,7 +341,7 @@ fn execute(
             })
         });
     }
-    run_on_thread(policy, filename, program, session)
+    run_on_thread(policy, filename, program, session, limits)
 }
 
 // Create, execute, and dispose both V8 and Tokio on the same host thread.
@@ -279,6 +350,7 @@ fn run_on_thread(
     filename: &str,
     program: Program<'_>,
     session: Option<Session>,
+    limits: limits::RunLimits,
 ) -> Result<RunOutput, HostError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -288,7 +360,7 @@ fn run_on_thread(
             message: format!("event loop initialization failed: {error}"),
             output: RunOutput::default(),
         })?;
-    let mut isolate = embedding::new_isolate();
+    let mut isolate = embedding::new_isolate_with_heap_limit(limits.heap_mb);
     microtasks::install(&mut isolate);
     isolate.set_host_import_module_dynamically_callback(modules::reject_dynamic_import);
     isolate.set_slot(HostState {
@@ -300,6 +372,7 @@ fn run_on_thread(
         rejections: microtasks::PromiseRejections::default(),
     });
 
+    let guard = limits::Guard::install(&mut isolate, limits);
     let result = {
         v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
@@ -340,6 +413,14 @@ fn run_on_thread(
         };
         event_loop::run(scope, &runtime, failure, evaluation.as_ref())
     };
+
+    let limit_failure = guard.finish(&mut isolate);
+    if limit_failure.is_some() {
+        // Blocking HTTP cannot be canceled. Let its bounded worker finish in
+        // the background; it owns no V8 handles and cannot deliver a result.
+        runtime.shutdown_background();
+    }
+    let result = limit_failure.map_or(result, Err);
 
     // Drop all module handles while their isolate is still alive.
     isolate.remove_slot::<modules::ModuleStore>();

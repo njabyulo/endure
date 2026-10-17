@@ -177,7 +177,13 @@ pub(crate) fn run(
         {
             v8::scope!(let scope, scope);
             v8::tc_scope!(let scope, scope);
+            if let Some(error) = super::limits::failure(scope) {
+                return Err(error);
+            }
             super::microtasks::drain(scope);
+            if let Some(error) = super::limits::failure(scope) {
+                return Err(error);
+            }
             if failure.is_none() {
                 if let Some(evaluation) = evaluation {
                     let promise = v8::Local::new(scope, evaluation);
@@ -186,6 +192,9 @@ pub(crate) fn run(
                         module_failed = true;
                     }
                 }
+            }
+            if let Some(error) = super::limits::failure(scope) {
+                return Err(error);
             }
             if let Some(exception) = scope.exception() {
                 let message = exception.to_rust_string_lossy(scope);
@@ -357,7 +366,15 @@ pub(crate) fn run(
             .transpose()?;
         let completion = match cached {
             Some(completion) => completion,
-            None => runtime.block_on(next_completion(&mut tasks, timer, wake)),
+            None => {
+                super::limits::pause(scope);
+                if let Some(error) = super::limits::failure(scope) {
+                    return Err(error);
+                }
+                let completion = runtime.block_on(next_completion(&mut tasks, timer, wake));
+                super::limits::resume(scope);
+                completion
+            }
         };
         if matches!(completion, Completion::PollWaits) {
             continue;
@@ -453,6 +470,9 @@ pub(crate) fn run(
                     callback.call(scope, receiver, &args);
                 }
             }
+        }
+        if let Some(error) = super::limits::failure(scope) {
+            return Err(error);
         }
         if let Some(exception) = scope.exception() {
             let message = exception.to_rust_string_lossy(scope);

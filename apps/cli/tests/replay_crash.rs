@@ -51,6 +51,7 @@ struct Process {
 impl Process {
     fn spawn(directory: &Path, args: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_ondure"))
+            .arg("__worker")
             .current_dir(directory)
             .args(args)
             .stdout(Stdio::piped())

@@ -466,6 +466,22 @@ pub fn approve_run(
     seq: u64,
     answer: bool,
 ) -> Result<RunOutput, crate::HostError> {
+    approve_run_with_limits(
+        path,
+        run_id,
+        seq,
+        answer,
+        super::limits::RunLimits::default(),
+    )
+}
+
+pub fn approve_run_with_limits(
+    path: &Path,
+    run_id: &str,
+    seq: u64,
+    answer: bool,
+    limits: super::limits::RunLimits,
+) -> Result<RunOutput, crate::HostError> {
     let record_answer = || -> Result<(), String> {
         let _lease = RunLease::acquire(path, &format!("run:{run_id}"))?;
         let mut journal = Journal::open(path).map_err(|e| e.to_string())?;
@@ -488,7 +504,7 @@ pub fn approve_run(
         message,
         output: RunOutput::default(),
     })?;
-    crate::replay_run(path, run_id, None)
+    crate::replay_run_with_limits(path, run_id, None, limits)
 }
 
 /// Result of attempting one ready run. A failed run does not stop the batch.
@@ -500,6 +516,13 @@ pub struct WakeOutcome {
 
 /// Recover abandoned runs and wake ready waits, skipping runs with live owners.
 pub fn wake_ready(path: &Path) -> Result<Vec<WakeOutcome>, crate::HostError> {
+    wake_ready_with_limits(path, super::limits::RunLimits::default())
+}
+
+pub fn wake_ready_with_limits(
+    path: &Path,
+    limits: super::limits::RunLimits,
+) -> Result<Vec<WakeOutcome>, crate::HostError> {
     let fail = |message| crate::HostError {
         filename: path.display().to_string(),
         message,
@@ -511,7 +534,7 @@ pub fn wake_ready(path: &Path) -> Result<Vec<WakeOutcome>, crate::HostError> {
         .recoverable_runs()
         .map_err(|e| fail(e.to_string()))?
     {
-        let result = match wake_run(path, &journal, &run.id) {
+        let result = match wake_run(path, &journal, &run.id, limits) {
             Ok(None) => continue,
             Ok(Some(run)) => Ok(run),
             Err(error) => Err(error),
@@ -528,6 +551,7 @@ fn wake_run(
     path: &Path,
     journal: &Journal,
     run_id: &str,
+    limits: super::limits::RunLimits,
 ) -> Result<Option<super::journal::RunRecord>, crate::HostError> {
     let fail = |message| crate::HostError {
         filename: run_id.into(),
@@ -546,7 +570,7 @@ fn wake_run(
         return Ok(None);
     }
     let (graph, policy, session) = Session::resume_with_lease(path, run_id, lease).map_err(fail)?;
-    crate::host::replay_session(graph, policy, session, None)?;
+    crate::host::replay_session(graph, policy, session, None, limits)?;
     journal
         .get_run(run_id)
         .map(Some)
@@ -574,7 +598,14 @@ mod scheduler_tests {
                 .iter()
                 .any(|run| run.id == status));
             journal.finish_run(status, status, "saved", "").unwrap();
-            assert!(wake_run(&path, &journal, status).unwrap().is_none());
+            assert!(wake_run(
+                &path,
+                &journal,
+                status,
+                super::super::limits::RunLimits::default()
+            )
+            .unwrap()
+            .is_none());
             assert_eq!(journal.get_run(status).unwrap().status, status);
         }
         drop(journal);
