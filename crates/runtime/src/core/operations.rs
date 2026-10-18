@@ -88,7 +88,6 @@ pub(crate) fn approval_outcome(answer: &str) -> Result<Value, String> {
 
 /// Inspect decoded provider strings, keys, and canonical scalar text before
 /// committing a response. This exact match check does not decode obfuscations.
-
 pub(crate) fn contains_secret(value: &Value, secret: &str) -> bool {
     if secret.is_empty() {
         return false;
