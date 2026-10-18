@@ -5,7 +5,7 @@ export type FeatureExample = { title: string; detail: string; code: string; path
 
 export function FeatureExamples({ examples }: { examples: FeatureExample[] }) {
   return <section className="feature-examples content-inset" id="features" aria-labelledby="features-title">
-    <div className="section-heading"><div><span className="eyebrow">04 / SEVEN RUNTIME PRIMITIVES</span><h2 id="features-title">An agent’s work.<br /><em>A runtime’s responsibility.</em></h2></div><p>Each example connects a workflow to a boundary the host can enforce and record.</p></div>
+    <div className="section-heading"><div><span className="eyebrow">04 / SEVEN RUNTIME PRIMITIVES</span><h2 id="features-title">An agent’s work.<br /><em>A runtime’s responsibility.</em></h2></div><p>JavaScript excerpts run inside an exported agent handler. Each linked fixture includes its host configuration and runnable commands.</p></div>
     <div className="feature-example-grid">{examples.map((example, index) => <Example key={example.title} example={example} index={index} />)}</div>
   </section>;
 }

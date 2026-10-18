@@ -36,6 +36,7 @@ function Header() {
         <a href="#runtime" onClick={() => setOpen(false)}>
           Runtime
         </a>
+        <a href="#features" onClick={() => setOpen(false)}>Features</a>
         <a href="#recovery" onClick={() => setOpen(false)}>
           Recovery
         </a>

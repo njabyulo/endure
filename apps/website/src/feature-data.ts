@@ -4,14 +4,15 @@ export const featureExamples: FeatureExample[] = [
   {
     title: "Durable execution",
     detail: "A committed model response is reused after interruption. Replay verifies captured code and history, then resumes supported unfinished work under its retry policy.",
-    path: "examples/model-operations/README.md",
-    code: `const result = await ctx.model.call({
-  prompt: "Welcome the new customer",
-  max_output_tokens: 32,
+    path: "examples/onboarding/README.md",
+    code: `const welcome = await ctx.model.call(
+  \`Welcome \${input.name}\`, { max_output_tokens: 32 });
+const answer = await ctx.human.approve({
+  action: "Register customer in the local mock receiver",
+  rationale: welcome.text,
 });
-console.log(result.text);
-// Replay uses the committed response.
-// An interrupted request may remain uncertain.`,
+// After restart, committed model + approval outcomes replay.
+// The linked fixture kills the process and verifies recovery.`,
   },
   {
     title: "Capability permissions",
