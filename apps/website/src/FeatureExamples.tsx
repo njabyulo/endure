@@ -37,6 +37,12 @@ function Example({
   example: FeatureExample;
   index: number;
 }) {
+  const excerptLabel =
+    example.syntax === "yaml"
+      ? "CONFIGURATION EXCERPT"
+      : example.syntax === "shellscript"
+        ? "CLI EXCERPT"
+        : "AGENT HANDLER EXCERPT";
   const [copied, setCopied] = useState(false);
   const [failed, setFailed] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -48,6 +54,7 @@ function Example({
       setCopied(true);
       setFailed(false);
     } catch {
+      setCopied(false);
       setFailed(true);
     }
     timer.current = setTimeout(() => {
@@ -68,7 +75,7 @@ function Example({
       <p>{example.detail}</p>
       <div className="feature-code">
         <div className="code-heading">
-          <span>RUNNABLE EXAMPLE</span>
+          <span>{excerptLabel}</span>
           <button onClick={copy} aria-label={`Copy ${example.title} example`}>
             <Icon name={copied ? "check" : "copy"} size={14} />
             {copied ? "Copied" : "Copy"}
