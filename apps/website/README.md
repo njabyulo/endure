@@ -38,3 +38,11 @@ estimates, trusted local approval and process-crash evidence from stronger claim
 Desktop/mobile browser QA covers layout, navigation/Escape behavior, code copying
 and the interruption/recovery controls. Tests also check copy failure fallback
 and all example targets. CI checks are independent from local verification.
+
+Code examples use [Shiki](https://shiki.style/) at build time. The shared Vite and
+Vitest plugin in `build/highlight.ts` loads only JavaScript, YAML and shell
+grammars, then emits token data for `src/HighlightedCode.tsx` to render safely as
+React text. The highlighter and grammars are excluded from the browser bundle.
+Add feature snippets to `src/feature-data.ts` (set `syntax` for YAML or shell),
+and installation snippets to `src/installation-code.ts`; the next dev-server
+restart or build regenerates their highlighting. Copy buttons retain raw source.

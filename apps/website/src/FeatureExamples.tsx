@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icons";
-
-export type FeatureExample = { title: string; detail: string; code: string; path: string; language?: string };
+import { HighlightedCode } from "./HighlightedCode";
+import type { FeatureExample } from "./feature-data";
 
 export function FeatureExamples({ examples }: { examples: FeatureExample[] }) {
   return <section className="feature-examples content-inset" id="features" aria-labelledby="features-title">
@@ -23,7 +23,7 @@ function Example({ example, index }: { example: FeatureExample; index: number })
   return <article className="feature-example" aria-labelledby={`feature-${index}`}>
     <span className="eyebrow">{String(index + 1).padStart(2, "0")} / {example.language ?? "JAVASCRIPT"}</span>
     <h3 id={`feature-${index}`}>{example.title}</h3><p>{example.detail}</p>
-    <div className="feature-code"><div className="code-heading"><span>RUNNABLE EXAMPLE</span><button onClick={copy} aria-label={`Copy ${example.title} example`}><Icon name={copied ? "check" : "copy"} size={14}/>{copied ? "Copied" : "Copy"}</button></div><pre tabIndex={0} aria-label={`${example.title} code`}><code>{example.code}</code></pre></div>
+    <div className="feature-code"><div className="code-heading"><span>RUNNABLE EXAMPLE</span><button onClick={copy} aria-label={`Copy ${example.title} example`}><Icon name={copied ? "check" : "copy"} size={14}/>{copied ? "Copied" : "Copy"}</button></div><pre tabIndex={0} aria-label={`${example.title} code`}><HighlightedCode code={example.code} /></pre></div>
     <span className="copy-status" role="status">{failed ? "Select the code to copy manually." : copied ? "Example copied." : ""}</span>
     <a className="text-link" href={`https://github.com/njabyulo/endure/blob/feat/agent-runtime-website/${example.path}`} target="_blank" rel="noreferrer">Run this example <Icon name="arrow" size={15}/></a>
   </article>;

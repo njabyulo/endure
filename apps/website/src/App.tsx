@@ -6,10 +6,10 @@ import { RecoveryWalkthrough } from "./RecoveryWalkthrough";
 import { RuntimeArchitecture } from "./RuntimeArchitecture";
 import { Icon, Mark } from "./Icons";
 import "./App.css";
+import { HighlightedCode } from "./HighlightedCode";
+import { INSTALL, APPROVAL } from "./installation-code";
 
 const GITHUB = "https://github.com/njabyulo/endure";
-const INSTALL =
-  "git clone --branch feat/agent-runtime-website https://github.com/njabyulo/endure.git\ncd endure\ncargo build --bin ondure\npython3 examples/model-operations/run.py";
 
 function Header() {
   const [open, setOpen] = useState(false);
@@ -97,7 +97,7 @@ function CopyInstall() {
         </button>
       </div>
       <pre tabIndex={0} aria-label="Build and run commands">
-        <code>{INSTALL}</code>
+        <HighlightedCode code={INSTALL} />
       </pre>
       <span role="status" className="copy-status">
         {state === "copied"
@@ -254,7 +254,7 @@ function App() {
               <CopyInstall />
               <div className="approval-example">
                 <div className="code-heading"><span>examples/agent-lifecycle/main.ts</span><span>SUPPORTED TODAY</span></div>
-                <pre tabIndex={0} aria-label="Durable approval example"><code>{'const decision = await ctx.human.approve({\n  action: "Continue onboarding?",\n  timeout: "1h",\n  onTimeout: "reject",\n});\nconsole.log(decision.approved, decision.note);'}</code></pre>
+                <pre tabIndex={0} aria-label="Durable approval example"><HighlightedCode code={APPROVAL} /></pre>
                 <p>A pending approval is persisted. Once other live work finishes, the isolate is released. Answer with the CLI to reconstruct the run and continue.</p>
                 <a className="text-link" href={`${GITHUB}/blob/feat/agent-runtime-website/examples/agent-lifecycle/README.md`} target="_blank" rel="noreferrer">Approval and recovery commands <Icon name="arrow" size={15} /></a>
               </div>

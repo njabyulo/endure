@@ -1,4 +1,4 @@
-import type { FeatureExample } from "./FeatureExamples";
+export type FeatureExample = { title: string; detail: string; code: string; path: string; language?: string; syntax?: "javascript" | "yaml" | "shellscript" };
 
 export const featureExamples: FeatureExample[] = [
   {
@@ -43,6 +43,7 @@ await ctx.state.compareAndSet("visits", current?.version ?? 0,
     detail: "Reserve token and spend estimates before dispatch. Queue work behind concurrency and rate limits. Elapsed deadlines include parked time; usage and configured prices guide reconciliation.",
     path: "examples/resource-budgets/README.md",
     language: "OPERATOR YAML",
+    syntax: "yaml",
     code: `resources:
   token_limit: 10000
   dollar_limit_micros: 2000000 # USD 2
@@ -56,6 +57,7 @@ await ctx.state.compareAndSet("visits", current?.version ?? 0,
     detail: "Inspect recorded inputs, permissions, outcomes and usage. Compare registrations and outcomes across runs. Supplied rationale can be recorded; hidden model reasoning is not exposed.",
     path: "examples/inspection.md",
     language: "TERMINAL",
+    syntax: "shellscript",
     code: `ondure log inspect-a
 ondure explain inspect-a
 ondure diff inspect-a inspect-b
