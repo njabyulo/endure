@@ -292,6 +292,10 @@ pub(crate) fn run(
             .as_ref()
             .is_some_and(|session| session.has_history());
         let mut schedule_at: Option<i64> = None;
+        // Once one category is full, requeue the rest without more SQLite
+        // admissions in this pass. Owned task completion will wake the loop.
+        let mut tool_blocked = false;
+        let mut model_blocked = false;
         let expired = scope
             .get_slot::<HostState>()
             .expect("host state installed")
@@ -360,7 +364,9 @@ pub(crate) fn run(
                 state.require_network(&url)?;
                 state.effective_capabilities.borrow().is_none()
             };
-            let admission = if let Some(session) = scope
+            let admission = if tool_blocked {
+                super::resources::Admission::Blocked
+            } else if let Some(session) = scope
                 .get_slot::<HostState>()
                 .expect("host state installed")
                 .session
@@ -373,6 +379,17 @@ pub(crate) fn run(
             };
             match admission {
                 super::resources::Admission::Ready => {}
+                super::resources::Admission::Blocked => {
+                    tool_blocked = true;
+                    scope
+                        .get_slot::<HostState>()
+                        .expect("host state installed")
+                        .operations
+                        .borrow_mut()
+                        .queued
+                        .push((id, url));
+                    continue;
+                }
                 super::resources::Admission::Deferred(at) => {
                     schedule_at = Some(schedule_at.map_or(at, |old| old.min(at)));
                     scope
@@ -437,13 +454,30 @@ pub(crate) fn run(
             if let Some(tool) = &job.required_tool {
                 state.require_tool(tool)?;
             }
-            let admission = if let Some(session) = state.session.borrow_mut().as_mut() {
+            let model_job = job.name == "model.call";
+            let blocked = if model_job {
+                model_blocked
+            } else {
+                tool_blocked
+            };
+            let admission = if blocked {
+                super::resources::Admission::Blocked
+            } else if let Some(session) = state.session.borrow_mut().as_mut() {
                 session.admit_resource(id, &job.name, &job.args)?
             } else {
                 super::resources::Admission::Ready
             };
             match admission {
                 super::resources::Admission::Ready => {}
+                super::resources::Admission::Blocked => {
+                    if model_job {
+                        model_blocked = true;
+                    } else {
+                        tool_blocked = true;
+                    }
+                    state.operations.borrow_mut().json_queued.push((id, job));
+                    continue;
+                }
                 super::resources::Admission::Deferred(at) => {
                     schedule_at = Some(schedule_at.map_or(at, |old| old.min(at)));
                     state.operations.borrow_mut().json_queued.push((id, job));

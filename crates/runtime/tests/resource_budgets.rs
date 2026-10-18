@@ -366,3 +366,42 @@ fn previously_committed_wait_answer_replays_after_elapsed_deadline() {
         "saved answer\n"
     );
 }
+
+#[test]
+fn concurrency_only_queues_wake_on_completion_without_rate_or_deadline_timers() {
+    for model in [true, false] {
+        let fixture = Fixture::new(10, true);
+        let body = if model {
+            "console.log((await Promise.all(Array.from({length:8},()=>ctx.model.call('queued')))).length);".to_string()
+        } else {
+            format!("console.log((await Promise.all(Array.from({{length:8}},()=>fetch('{}')))).length);",fixture.endpoint)
+        };
+        let project = Project::new(&fixture.origin, &body);
+        let run = project.run(&fixture.config(ResourceLimits {
+            model_concurrency: 1,
+            tool_concurrency: 1,
+            ..Default::default()
+        }));
+        assert_eq!(run.stdout, "8\n");
+        assert_eq!(fixture.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.hits.load(Ordering::SeqCst), 8);
+        assert_eq!(
+            replay_run(&project.journal(), &run.id, None)
+                .unwrap()
+                .stdout,
+            run.stdout
+        );
+        assert_eq!(fixture.hits.load(Ordering::SeqCst), 8);
+        let connection = rusqlite::Connection::open(project.journal()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM resource_reservations WHERE state='settled'",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )
+                .unwrap(),
+            8
+        );
+    }
+}

@@ -83,6 +83,9 @@ CREATE INDEX reservation_run ON resource_reservations(run_id,category,admitted_a
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Admission {
     Ready,
+    /// Capacity can change only when an owned operation completes; no timer.
+    Blocked,
+    /// Rolling rate window opens at this absolute epoch millisecond.
     Deferred(i64),
     Denied(String),
 }
@@ -213,7 +216,7 @@ impl Journal {
         };
         let active:u64=tx.query_row("SELECT COUNT(*) FROM resource_reservations WHERE run_id=?1 AND ((?2='model' AND category='model') OR (?2!='model' AND category!='model')) AND state='active'",params![run,category],|r|r.get(0)).map_err(db)?;
         if active >= concurrency as u64 {
-            return Ok(Admission::Deferred(now.saturating_add(10)));
+            return Ok(Admission::Blocked);
         }
         if let Some(rate) = rate {
             let cutoff = now
@@ -344,6 +347,47 @@ mod tests {
         serde_json::json!({"request":{"max_tokens":10}})
     }
     #[test]
+    fn full_concurrency_is_untimed_until_a_completion_releases_its_slot() {
+        let (path, mut j) = journal();
+        let limits = ResourceLimits {
+            model_concurrency: 1,
+            ..Default::default()
+        };
+        j.initialize_resources("run", &limits, 0, false).unwrap();
+        assert_eq!(
+            j.admit_resource("run", 0, "model.call", &args(), &limits, 100)
+                .unwrap(),
+            Admission::Ready
+        );
+        for now in [100, 110, 100_000] {
+            assert_eq!(
+                j.admit_resource("run", 1, "model.call", &args(), &limits, now)
+                    .unwrap(),
+                Admission::Blocked
+            );
+        }
+        assert_eq!(
+            j.connection
+                .query_row("SELECT COUNT(*) FROM resource_reservations", [], |row| row
+                    .get::<_, u64>(
+                    0
+                ))
+                .unwrap(),
+            1
+        );
+        let tx = j.connection.transaction().unwrap();
+        settle(&tx, "run", 0, r#"{"Ok":{"usage":null}}"#).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            j.admit_resource("run", 1, "model.call", &args(), &limits, 100_000)
+                .unwrap(),
+            Admission::Ready
+        );
+        drop(j);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn atomic_competing_reservations_cannot_overspend() {
         let (path, mut j) = journal();
         let limits = ResourceLimits {
@@ -397,7 +441,7 @@ mod tests {
         assert!(matches!(
             j.admit_resource("run", 1, "model.call", &args(), &limits, 100)
                 .unwrap(),
-            Admission::Deferred(_)
+            Admission::Blocked
         ));
         drop(j);
         let mut j = Journal::open(&path).unwrap();
@@ -493,7 +537,7 @@ mod tests {
             journal
                 .admit_resource("run", 1, "fetch.get", &Value::Null, &limits, 100)
                 .unwrap(),
-            Admission::Deferred(_)
+            Admission::Blocked
         ));
         let tx = journal.connection.transaction().unwrap();
         settle(

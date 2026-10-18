@@ -37,7 +37,10 @@ Input estimates reserve configured tokens; requested output limits reserve
 output tokens. These estimates may differ from provider usage.
 
 Admission and reservation are a SQLite transaction. Deferred concurrency/rate
-requests remain queued without dispatch. Completed model usage reconciles token
+requests remain queued without dispatch. Concurrency deferral waits for an owned
+operation completion rather than a polling timer, and skips further admissions
+in that category for the current scheduling pass. Rate deferral wakes at the
+calculated rolling-window boundary; elapsed deadlines remain independent wakes. Completed model usage reconciles token
 counts when total usage (or both component counts) is supplied. Dollar usage
 requires both component counts and uses the configured prices, rounding each
 component up to a micro. Unknown usage, transport failures, interrupted attempts,
