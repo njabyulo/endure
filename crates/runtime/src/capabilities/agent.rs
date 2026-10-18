@@ -247,6 +247,7 @@ pub(crate) fn create_context<'s>(
     set_property(scope, human, "approve", approve.into());
     set_property(scope, context, "human", human.into());
     super::memory::install_context(scope, context)?;
+    crate::integrations::model::install_context(scope, context)?;
     Ok(context)
 }
 
