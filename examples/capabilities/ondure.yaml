@@ -1,0 +1,6 @@
+grants:
+  network_origins: ["http://127.0.0.1:8787"]
+  tools: []
+  memory_scopes: []
+  child_agents: []
+credentials: {}

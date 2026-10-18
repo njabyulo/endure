@@ -30,3 +30,7 @@ pub use core::operations::{
     OperationCancellation, OperationIdentity, RecoveryPolicy, MAX_OPERATION_ARGUMENT_BYTES,
     MAX_OPERATION_RESULT_BYTES,
 };
+
+pub use capabilities::config::{Capabilities, HostConfig};
+
+pub use host::{run_durable_with_config, run_request_with_config};

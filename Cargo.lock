@@ -1082,6 +1082,7 @@ dependencies = [
  "swc_core",
  "tokio",
  "ureq",
+ "url",
  "uuid",
  "v8",
 ]

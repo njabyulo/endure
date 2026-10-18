@@ -8,7 +8,7 @@ use super::{
     },
     parking::RunLease,
 };
-use crate::{Policy, RunOutput};
+use crate::{HostConfig, Policy, RunOutput};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -34,6 +34,7 @@ pub(crate) struct Session {
     intents: Vec<OpIntent>,
     last_flush: Instant,
     pub(crate) input: Value,
+    pub(crate) host_config: Option<HostConfig>,
     waits: BTreeMap<u32, WaitRecord>,
 }
 
@@ -55,17 +56,38 @@ impl Session {
         request_id: Option<&str>,
         input: Value,
     ) -> Result<Self, String> {
+        Self::create_request_config(path, id, policy, graph, request_id, input, None)
+    }
+
+    pub(crate) fn create_request_config(
+        path: &Path,
+        id: &str,
+        policy: &Policy,
+        graph: &ModuleGraph,
+        request_id: Option<&str>,
+        input: Value,
+        host_config: Option<&HostConfig>,
+    ) -> Result<Self, String> {
+        if let Some(config) = host_config {
+            config.validate()?;
+        }
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let lease = RunLease::acquire(path, &format!("run:{id}"))?;
         let mut journal = Journal::open(path).map_err(|e| e.to_string())?;
-        let snapshot = serde_json::json!({"graph": graph, "net": policy.net, "input": input});
-        let identity = if request_id.is_some() {
+        let mut snapshot = serde_json::json!({"graph": graph, "net": policy.net, "input": input});
+        if let Some(config) = host_config {
+            snapshot["host_config"] = serde_json::to_value(config).map_err(|e| e.to_string())?;
+        }
+        let mut identity = if request_id.is_some() {
             serde_json::json!({"net": policy.net, "input": input})
         } else {
             serde_json::json!({"net": policy.net})
         };
+        if let Some(config) = host_config {
+            identity["host_config"] = serde_json::to_value(config).map_err(|e| e.to_string())?;
+        }
         journal
             .create_run(
                 id,
@@ -88,6 +110,7 @@ impl Session {
             intents: Vec::new(),
             last_flush: Instant::now(),
             input,
+            host_config: host_config.cloned(),
             waits: BTreeMap::new(),
         })
     }
@@ -114,6 +137,14 @@ impl Session {
         let policy = Policy {
             net: snapshot["net"].as_bool().ok_or("invalid recorded policy")?,
         };
+        let host_config: Option<HostConfig> = snapshot
+            .get("host_config")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        if let Some(config) = &host_config {
+            config.validate()?;
+        }
         let operations = journal.operations(id).map_err(|e| e.to_string())?;
         for (index, op) in operations.iter().enumerate() {
             if op.seq != index as u64 {
@@ -134,6 +165,7 @@ impl Session {
             intents: Vec::new(),
             last_flush: Instant::now(),
             input: snapshot.get("input").cloned().unwrap_or(Value::Null),
+            host_config,
             waits: BTreeMap::new(),
         };
         Ok((graph, policy, session))
