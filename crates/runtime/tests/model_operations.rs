@@ -422,3 +422,67 @@ fn killed_model_request_does_not_automatically_dispatch_again() {
     assert!(error.message.contains("InterruptedError"));
     assert_eq!(fixture.hits.load(Ordering::SeqCst), 1);
 }
+
+fn assert_oversized_model_response_is_committed(body: String, expected_error: &str) {
+    let fixture = Fixture::new(200, body);
+    let project = Project::new(&fixture.origin(), "ctx.model.call('Hello')");
+    let error = run_request_with_config(
+        &fixture.config(),
+        &project.graph(),
+        &project.journal(),
+        "oversized-response",
+        "null",
+        RunLimits::default(),
+    )
+    .unwrap_err();
+    assert!(error.message.contains(expected_error), "{error}");
+    assert!(error.output.stdout.is_empty());
+    let journal = Journal::open(&project.journal()).unwrap();
+    let run = journal.find_request("oversized-response").unwrap().unwrap();
+    assert_eq!(run.status, "failed");
+    let operation = journal
+        .operations(&run.id)
+        .unwrap()
+        .into_iter()
+        .find(|operation| operation.name == "model.call")
+        .unwrap();
+    assert_eq!(operation.state, "completed");
+    let encoded = operation.result.unwrap();
+    assert!(
+        encoded.len() < 1024,
+        "oversized payload entered the journal"
+    );
+    let recorded: Result<Value, String> = serde_json::from_str(&encoded).unwrap();
+    assert!(recorded.unwrap_err().contains(expected_error));
+    let attempts = journal.attempts(&run.id).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].state, "completed");
+    assert_eq!(fixture.hits.load(Ordering::SeqCst), 1);
+    let replayed = replay_run(&project.journal(), &run.id, None).unwrap_err();
+    assert_eq!(replayed.message, error.message);
+    assert!(replayed.output.stdout.is_empty());
+    assert_eq!(fixture.hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn oversized_raw_provider_response_commits_bounded_error_and_replays_without_dispatch() {
+    let text = "x".repeat(runtime::MAX_OPERATION_RESULT_BYTES + 1);
+    let body = json!({"choices":[{"message":{"content":text}}]}).to_string();
+    assert!(body.len() > runtime::MAX_OPERATION_RESULT_BYTES);
+    assert_oversized_model_response_is_committed(body, "model response exceeds result limit");
+}
+
+#[test]
+fn normalized_result_envelope_limit_applies_when_provider_body_fits() {
+    let empty = json!({"choices":[{"message":{"content":""}}]}).to_string();
+    let text = "x".repeat(runtime::MAX_OPERATION_RESULT_BYTES - empty.len());
+    let body = json!({"choices":[{"message":{"content":text}}]}).to_string();
+    assert_eq!(body.len(), runtime::MAX_OPERATION_RESULT_BYTES);
+    let normalized: Result<Value, String> = Ok(json!({
+        "text": text,
+        "usage": null,
+        "finish_reason": null,
+    }));
+    assert!(serde_json::to_vec(&normalized).unwrap().len() > runtime::MAX_OPERATION_RESULT_BYTES);
+    assert_oversized_model_response_is_committed(body, "host operation result exceed");
+}
