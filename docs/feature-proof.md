@@ -22,7 +22,7 @@ Review these boundaries independently:
 | Duplicate effects | MCP process-kill test refuses unsafe unknown outcomes; explicitly safe recovery records another attempt; onboarding retries only a keyed idempotent mock and checks one effect. |
 | Resource accounting | Resource-budget tests cover atomic reservations, unknown usage, restart accounting, concurrency, rates, and elapsed deadlines; child allocations reserve parent resources. Configured price accounting is separate from provider invoices. |
 | Replay integrity | Committed model/tool outcomes and memory retrieval are reused; captured modules/config survive source removal; low-level replay/divergence, clock/randomness, cancellation, journal migrations, and crash tests remain. |
-| Credentials | Shared recursive detection checks response string values and object keys before model/MCP outcomes commit. Subprocess fixtures send real Authorization headers and verify credentials never appear in recorded arguments, results, output, or JavaScript responses. Raw remote error bodies are not propagated. |
+| Credentials | Shared recursive detection checks response string values, object keys, and canonical JSON number/boolean/null text before model/MCP outcomes commit. This exact reflection check does not decode arbitrary obfuscations. Subprocess fixtures send real Authorization headers and verify credentials never appear in recorded arguments, results, output, or JavaScript responses. Raw remote error bodies are not propagated. |
 | Approval | Agent lifecycle tests cover parking, notes, timeouts, first-answer behavior, and continuation; the integrated workflow reuses the committed approval after process interruption. |
 
 Agent contexts use `ctx.sleep`, `ctx.human`, `ctx.context`, `ctx.memory`,

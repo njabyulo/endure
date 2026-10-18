@@ -86,8 +86,9 @@ pub(crate) fn approval_outcome(answer: &str) -> Result<Value, String> {
     Ok(outcome)
 }
 
-/// Inspect decoded provider strings and keys before committing any response.
-/// Rejecting an echo preserves the credential boundary without changing data.
+/// Inspect decoded provider strings, keys, and canonical scalar text before
+/// committing a response. This exact match check does not decode obfuscations.
+
 pub(crate) fn contains_secret(value: &Value, secret: &str) -> bool {
     if secret.is_empty() {
         return false;
@@ -98,7 +99,7 @@ pub(crate) fn contains_secret(value: &Value, secret: &str) -> bool {
         Value::Object(values) => values
             .iter()
             .any(|(key, value)| key.contains(secret) || contains_secret(value, secret)),
-        _ => false,
+        Value::Number(_) | Value::Bool(_) | Value::Null => value.to_string().contains(secret),
     }
 }
 
@@ -146,6 +147,15 @@ mod tests {
             &serde_json::json!({"public":"value"}),
             "private-token"
         ));
+        for (value, secret) in [
+            (serde_json::json!({"nested":[123456789]}), "123456789"),
+            (serde_json::json!(true), "true"),
+            (serde_json::json!(false), "false"),
+            (Value::Null, "null"),
+        ] {
+            assert!(contains_secret(&value, secret));
+        }
+        assert!(!contains_secret(&serde_json::json!(987654321), "123456789"));
         assert!(!contains_secret(&Value::Null, ""));
     }
     #[test]

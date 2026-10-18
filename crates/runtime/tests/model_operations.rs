@@ -602,10 +602,23 @@ fn configured_model_timeout_commits_unknown_outcome_and_replays_without_dispatch
 #[test]
 fn echoed_model_credentials_in_values_or_keys_are_rejected_before_delivery() {
     let secret = "fixture-private-token-do-not-record";
-    for response in [
-        json!({"choices":[{"message":{"content":format!("echo {secret}")}}]}),
-        json!({"choices":[{"message":{"content":"public"}}],"metadata":{(secret):"hidden"}}),
-        json!({"choices":[{"message":{"content":"public"}}],"metadata":[{"value":secret}]}),
+    for (secret, response) in [
+        (
+            secret,
+            json!({"choices":[{"message":{"content":format!("echo {secret}")}}]}),
+        ),
+        (
+            secret,
+            json!({"choices":[{"message":{"content":"public"}}],"metadata":{(secret):"hidden"}}),
+        ),
+        (
+            secret,
+            json!({"choices":[{"message":{"content":"public"}}],"metadata":[{"value":secret}]}),
+        ),
+        (
+            "123456789",
+            json!({"choices":[{"message":{"content":"public"}}],"usage":{"total_tokens":123456789}}),
+        ),
     ] {
         let fixture = Fixture::new(200, response.to_string());
         let p = Project::new(&fixture.origin(), "ctx.model.call('Hello')");
@@ -641,6 +654,9 @@ fn echoed_model_credentials_in_values_or_keys_are_rejected_before_delivery() {
             .unwrap()
             .contains("contained a host credential"));
         assert!(!serde_json::to_string(&operations).unwrap().contains(secret));
+        assert!(!serde_json::to_string(&journal.attempts(&run.id).unwrap())
+            .unwrap()
+            .contains(secret));
         let replay = runtime::replay_run(&p.journal(), &run.id, None).unwrap_err();
         assert!(replay.message.contains("contained a host credential"));
         assert_eq!(fixture.hits.load(Ordering::SeqCst), 1);
