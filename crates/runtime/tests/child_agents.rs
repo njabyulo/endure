@@ -265,6 +265,7 @@ fn child_allocations_are_reserved_before_launch_and_reconciled_from_child_usage(
         model: "fixture".into(),
         credential: None,
         max_output_tokens: 4,
+        timeout_seconds: 30,
         retry_interrupted: false,
     });
     let run = p.run(&config);
