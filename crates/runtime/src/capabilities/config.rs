@@ -136,7 +136,13 @@ impl HostConfig {
             Err(error) => return Err(error.to_string()),
         };
         let value: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| e.to_string())?;
-        if value.get("grants").is_none() && value.get("credentials").is_none() {
+        let mapping = value
+            .as_mapping()
+            .ok_or("configuration must be a mapping")?;
+        if mapping
+            .keys()
+            .all(|key| key.as_str() == Some("permissions"))
+        {
             return Ok(None);
         }
         Self::from_yaml(&text).map(Some)
@@ -146,6 +152,22 @@ impl HostConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn misspelled_scoped_keys_never_fall_back_to_broad_legacy_policy() {
+        let path =
+            std::env::temp_dir().join(format!("ondure-config-{}.yaml", uuid::Uuid::new_v4()));
+        for text in [
+            "grant: {}",
+            "permissions: [net]\ngrant: {}",
+            "credential: API_KEY",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert!(HostConfig::load_optional(&path).is_err());
+        }
+        std::fs::write(&path, "permissions: [net]").unwrap();
+        assert!(HostConfig::load_optional(&path).unwrap().is_none());
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn requests_can_only_attenuate_grants() {
         let grants = HostConfig::from_yaml("grants:\n  tools: [read]\n  network_origins: ['https://example.com']\n  memory_scopes: [team]\n  child_agents: [worker]").unwrap().grants;

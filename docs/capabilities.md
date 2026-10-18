@@ -25,8 +25,7 @@ the same checks before dispatch.
 
 Agent declarations request `Capabilities`; their effective authority is the
 intersection of those requests and operator grants. Empty requests grant
-nothing, and requests cannot elevate legacy broad network policy. The agent
-lifecycle uses this host boundary before invoking a handler. Ordinary scripts
+nothing, and requests cannot elevate legacy broad network policy. The subsequent agent-lifecycle layer applies this host boundary before invoking a handler; this layer supplies the host boundary and tests its intersection. Ordinary scripts
 using scoped configuration receive the configured operator grants directly.
 
 Network grants are canonical HTTP(S) origins: scheme, host, and nondefault port,
