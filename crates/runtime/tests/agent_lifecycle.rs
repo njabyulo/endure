@@ -144,7 +144,7 @@ fn malformed_agent_or_duration_fails() {
 
 #[test]
 fn relative_sleep_parks_and_reuses_recorded_deadline_after_restart() {
-    let p = Project::new("import {agent} from 'ondure'; export default agent('sleep',async ctx=>{ console.log('before'); await ctx.sleep('30ms'); console.log('after'); });");
+    let p = Project::new("import {agent} from 'ondure'; export default agent('sleep',async ctx=>{ console.log('before'); await ctx.sleep('1h'); console.log('after'); });");
     let run = run_request(
         &Policy::default(),
         &p.graph(),
@@ -155,8 +155,14 @@ fn relative_sleep_parks_and_reuses_recorded_deadline_after_restart() {
     .unwrap();
     assert_eq!(run.status, "parked");
     assert_eq!(run.stdout, "before\n");
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    let mut journal = Journal::open(&p.journal()).unwrap();
+    let wait = journal.waits(&run.id).unwrap().remove(0);
+    assert!(wait.wake_at.is_some());
+    // Drive the persisted timer backend explicitly: the test verifies replay,
+    // not whether host scheduling and synchronous commits finish within 30ms.
+    journal.answer_wait(&run.id, wait.seq, "null").unwrap();
     let output = replay_run(&p.journal(), &run.id, None).unwrap();
+    assert_eq!(journal.waits(&run.id).unwrap()[0].wake_at, wait.wake_at);
     assert_eq!(output.stdout, "before\nafter\n");
     assert_eq!(
         Journal::open(&p.journal())
