@@ -37,6 +37,7 @@ pub use core::durability::approve_run_with_note_and_limits;
 pub use host::{run_durable_with_config, run_request_with_config};
 
 pub use core::memory::ContextLimits;
+pub use integrations::mcp::{McpServerConfig, McpToolConfig};
 pub use integrations::model::ModelConfig;
 
 pub use core::inspection::{diff_runs, inspect_run};
