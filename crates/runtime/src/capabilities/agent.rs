@@ -179,7 +179,7 @@ pub(crate) fn invoke_default(
     args: v8::FunctionCallbackArguments,
     mut output: v8::ReturnValue,
 ) {
-    let result = (|| -> Result<v8::Local<'_, v8::Value>, String> {
+    let result = (|| -> Result<Option<v8::Local<'_, v8::Value>>, String> {
         let namespace =
             v8::Local::<v8::Object>::try_from(args.data()).map_err(|_| "agent namespace")?;
         let key = v8::String::new(scope, "default").ok_or("default export name")?;
@@ -225,12 +225,13 @@ pub(crate) fn invoke_default(
         let input = v8::json::parse(scope, input).ok_or("agent input JSON")?;
         let handler = v8::Local::new(scope, &definition.0);
         let receiver = v8::undefined(scope);
-        handler
-            .call(scope, receiver.into(), &[context.into(), input])
-            .ok_or("agent handler failed".into())
+        // None leaves V8's original exception pending. Do not replace a
+        // handler's synchronous throw with an unrelated host error.
+        Ok(handler.call(scope, receiver.into(), &[context.into(), input]))
     })();
     match result {
-        Ok(value) => output.set(value),
+        Ok(Some(value)) => output.set(value),
+        Ok(None) => {}
         Err(error) => throw(scope, &error),
     }
 }

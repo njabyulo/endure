@@ -8,9 +8,11 @@ cargo run -- wake
 ```
 
 After the one-second persisted sleep becomes ready, `wake` proceeds to the
-approval and prints its run ID and wait sequence. Answer using those values:
+approval and prints the run ID. Inspect its recorded waits to find the approval
+sequence (the `seq` of the wait with `kind: "approval"`), then answer:
 
 ```sh
+cargo run -- log <run-id>
 cargo run -- approve <run-id> <wait-seq> yes --note 'Reviewed locally'
 cargo run -- replay <run-id>
 ```

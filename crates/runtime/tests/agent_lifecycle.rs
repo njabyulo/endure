@@ -215,3 +215,30 @@ fn oversized_note_is_rejected_before_committing_an_answer() {
         "accepted\n"
     );
 }
+
+#[test]
+fn handler_failures_preserve_original_message_and_failed_history_on_replay() {
+    for handler in [
+        "() => { throw Error('missinginput'); }",
+        "async () => { await Promise.resolve(); throw Error('missinginput'); }",
+    ] {
+        let project = Project::new(&format!(
+            "import {{agent}} from 'ondure'; export default agent('failure', {handler});"
+        ));
+        let error = run_request(
+            &Policy::default(),
+            &project.graph(),
+            &project.journal(),
+            "failed-request",
+            "null",
+        )
+        .unwrap_err();
+        assert_eq!(error.message, "Error: missinginput");
+        let journal = Journal::open(&project.journal()).unwrap();
+        let original = journal.find_request("failed-request").unwrap().unwrap();
+        assert_eq!(original.status, "failed");
+        let replayed = replay_run(&project.journal(), &original.id, None).unwrap_err();
+        assert_eq!(replayed.message, error.message);
+        assert_eq!(journal.get_run(&original.id).unwrap(), original);
+    }
+}
