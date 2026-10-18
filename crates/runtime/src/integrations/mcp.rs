@@ -469,12 +469,21 @@ mod tests {
             let worker = thread::spawn(move || loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
-                        let (headers, body) = read_request(&mut stream);
+                        let Some((headers, body)) = read_request(&mut stream) else {
+                            continue;
+                        };
                         let method = body["method"].as_str().unwrap_or("DELETE").to_string();
                         log.lock().unwrap().push((method.clone(), headers));
+                        if mode == "stalled" && method == "tools/call" {
+                            while !worker_stop.load(Ordering::Acquire) {
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                            continue;
+                        }
                         if method == "DELETE" || method == "notifications/initialized" {
                             let _=write!(stream,"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                             continue;
@@ -494,6 +503,8 @@ mod tests {
                             "tools/call" => {
                                 if mode == "oversized" {
                                     json!({"content":[{"type":"text","text":"x".repeat(MAX_OPERATION_RESULT_BYTES+1)}]})
+                                } else if mode == "credential_echo" {
+                                    json!({"content":[{"type":"text","text":"fixture-private-token-never-record"}],"structuredContent":{"greeting":"fixture-private-token-never-record"}})
                                 } else if mode == "bad_output" {
                                     json!({"content":[],"structuredContent":{"greeting":5}})
                                 } else {
@@ -588,16 +599,16 @@ mod tests {
             self.worker.take().unwrap().join().unwrap();
         }
     }
-    fn read_request(stream: &mut TcpStream) -> (String, Value) {
+    fn read_request(stream: &mut TcpStream) -> Option<(String, Value)> {
         let mut bytes = Vec::new();
         let mut byte = [0];
         while !bytes.ends_with(b"\r\n\r\n") {
-            if stream.read(&mut byte).unwrap() == 0 {
-                break;
+            if stream.read(&mut byte).ok()? == 0 {
+                return None;
             }
             bytes.push(byte[0]);
         }
-        let headers = String::from_utf8(bytes).unwrap();
+        let headers = String::from_utf8(bytes).ok()?;
         let length = headers
             .lines()
             .find_map(|line| {
@@ -607,11 +618,11 @@ mod tests {
             })
             .unwrap_or(0);
         let mut body = vec![0; length];
-        stream.read_exact(&mut body).unwrap();
-        (
+        stream.read_exact(&mut body).ok()?;
+        Some((
             headers,
             serde_json::from_slice(&body).unwrap_or(Value::Null),
-        )
+        ))
     }
     #[test]
     fn json_and_sse_tools_negotiate_sessions_and_validate_results() {
@@ -755,6 +766,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.message.contains("permission denied"));
+        let journal = directory.join("journal.sqlite3");
+        assert_eq!(
+            crate::replay_run(&journal, "run", None)
+                .unwrap_err()
+                .message,
+            error.message
+        );
+        assert!(crate::Journal::open(&journal)
+            .unwrap()
+            .attempts("run")
+            .unwrap()
+            .is_empty());
         assert!(fixture.methods().is_empty());
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -815,6 +838,172 @@ mod tests {
                 assert!(resumed.unwrap_err().message.contains("InterruptedError"));
                 assert_eq!(fixture.methods(), methods);
             }
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+    #[test]
+    fn mcp_process_worker() {
+        let Ok(directory) = std::env::var("ONDURE_MCP_TEST_PROJECT") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        let graph = crate::ModuleGraph::load(&directory.join("main.js")).unwrap();
+        let config: HostConfig =
+            serde_json::from_slice(&std::fs::read(directory.join("config.json")).unwrap()).unwrap();
+        crate::run_durable_with_config(
+            &config,
+            &graph,
+            &directory.join("journal.sqlite3"),
+            "run",
+            crate::RunLimits::default(),
+        )
+        .unwrap();
+    }
+    #[test]
+    fn process_kill_leaves_unsafe_mcp_effect_unrepeated() {
+        let fixture = Fixture::new("stalled");
+        let (directory, _, config) = agent_project(
+            &fixture,
+            "await ctx.tools.call('fixture.greet',{name:'reader'});",
+        );
+        std::fs::write(
+            directory.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "integrations::mcp::tests::mcp_process_worker",
+                "--nocapture",
+            ])
+            .env("ONDURE_MCP_TEST_PROJECT", &directory)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        for _ in 0..1000 {
+            if fixture.methods().contains(&"tools/call".into()) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let dispatched = fixture.methods().contains(&"tools/call".into());
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            dispatched,
+            "child never dispatched: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let journal = directory.join("journal.sqlite3");
+        assert_eq!(
+            crate::Journal::open(&journal)
+                .unwrap()
+                .attempts("run")
+                .unwrap()[0]
+                .state,
+            "dispatched"
+        );
+        let methods = fixture.methods();
+        assert!(crate::replay_run(&journal, "run", None)
+            .unwrap_err()
+            .message
+            .contains("InterruptedError"));
+        assert_eq!(fixture.methods(), methods);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn legacy_unsafe_pending_intent_without_attempt_metadata_is_not_retried() {
+        let fixture = Fixture::new("json");
+        let (directory, graph, config) = agent_project(
+            &fixture,
+            "await ctx.tools.call('fixture.greet',{name:'reader'});",
+        );
+        let journal = directory.join("journal.sqlite3");
+        crate::run_durable_with_config(
+            &config,
+            &graph,
+            &journal,
+            "run",
+            crate::RunLimits::default(),
+        )
+        .unwrap();
+        let connection = rusqlite::Connection::open(&journal).unwrap();
+        connection
+            .execute("DELETE FROM operation_attempts WHERE run_id='run'", [])
+            .unwrap();
+        connection.execute("UPDATE operations SET args_json=NULL,state='pending',result=NULL,completion_order=NULL WHERE run_id='run'",[]).unwrap();
+        connection
+            .execute("UPDATE runs SET status='running' WHERE id='run'", [])
+            .unwrap();
+        drop(connection);
+        let methods = fixture.methods();
+        assert!(crate::replay_run(&journal, "run", None)
+            .unwrap_err()
+            .message
+            .contains("InterruptedError"));
+        assert_eq!(fixture.methods(), methods);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn credentials_stay_in_host_and_echoed_secrets_never_enter_journal() {
+        for mode in ["json", "credential_echo"] {
+            let fixture = Fixture::new(mode);
+            let (directory, _, mut config) = agent_project(
+                &fixture,
+                "await ctx.tools.call('fixture.greet',{name:'reader'});",
+            );
+            config
+                .credentials
+                .insert("mcp".into(), "ONDURE_MCP_TEST_SECRET".into());
+            config.mcp_servers.get_mut("fixture").unwrap().credential = Some("mcp".into());
+            std::fs::write(
+                directory.join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let secret = "fixture-private-token-never-record";
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "integrations::mcp::tests::mcp_process_worker",
+                    "--nocapture",
+                ])
+                .env("ONDURE_MCP_TEST_PROJECT", &directory)
+                .env("ONDURE_MCP_TEST_SECRET", secret)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                mode == "json",
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(fixture
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, headers)| headers.contains(&format!("Authorization: Bearer {secret}"))));
+            let journal = crate::Journal::open(&directory.join("journal.sqlite3")).unwrap();
+            let run = journal.get_run("run").unwrap();
+            assert!(!run.graph.contains(secret));
+            assert!(!run.stdout.contains(secret));
+            assert!(!run.stderr.contains(secret));
+            assert!(!serde_json::to_string(&journal.operations("run").unwrap())
+                .unwrap()
+                .contains(secret));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+            if mode == "credential_echo" {
+                assert!(journal.operations("run").unwrap()[0]
+                    .result
+                    .as_ref()
+                    .unwrap()
+                    .contains("contained a host credential"));
+            }
+            drop(journal);
             std::fs::remove_dir_all(directory).unwrap();
         }
     }
