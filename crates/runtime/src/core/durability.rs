@@ -605,7 +605,8 @@ pub fn journal_log(path: &Path, run_id: &str) -> Result<String, String> {
     let ops = journal.operations(run_id).map_err(|e| e.to_string())?;
     let waits = journal.waits(run_id).map_err(|e| e.to_string())?;
     let attempts = journal.attempts(run_id).map_err(|e| e.to_string())?;
-    serde_json::to_string_pretty(&serde_json::json!({"id": run.id, "status": run.status, "request_id": run.request_id, "code_hash": run.code_hash, "operations": ops, "attempts": attempts, "waits": waits}))
+    let resources = journal.resource_report(run_id)?;
+    serde_json::to_string_pretty(&serde_json::json!({"id": run.id, "status": run.status, "request_id": run.request_id, "code_hash": run.code_hash, "operations": ops, "attempts": attempts, "resources": resources, "waits": waits}))
         .map_err(|e| e.to_string())
 }
 

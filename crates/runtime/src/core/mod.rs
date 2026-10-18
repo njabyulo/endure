@@ -14,4 +14,5 @@ pub(crate) mod transpilation;
 
 pub(crate) mod limits;
 
+pub(crate) mod inspection;
 pub(crate) mod resources;
