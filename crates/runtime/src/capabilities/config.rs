@@ -97,10 +97,12 @@ pub struct HostConfig {
     pub grants: Capabilities,
     /// Credential names map to environment-variable names, never secret values.
     pub credentials: BTreeMap<String, String>,
+    pub context_limits: crate::ContextLimits,
 }
 impl HostConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.grants.validate()?;
+        self.context_limits.validate()?;
         for reference in self.credentials.values() {
             let mut bytes = reference.bytes();
             if !bytes

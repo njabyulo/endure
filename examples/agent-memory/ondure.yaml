@@ -1,0 +1,6 @@
+grants:
+  memory_scopes: [demo]
+context_limits:
+  max_messages: 128
+  max_bytes: 262144
+  recent_messages: 16

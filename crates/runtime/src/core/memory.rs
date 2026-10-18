@@ -4,7 +4,8 @@ use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ContextLimits {
     pub max_messages: usize,
     pub max_bytes: usize,
@@ -17,6 +18,18 @@ impl Default for ContextLimits {
             max_bytes: 256 * 1024,
             recent_messages: 16,
         }
+    }
+}
+
+impl ContextLimits {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_messages == 0 || self.max_bytes == 0 || self.recent_messages == 0 {
+            return Err("context limits must be positive".into());
+        }
+        if self.recent_messages > self.max_messages {
+            return Err("recent_messages cannot exceed max_messages".into());
+        }
+        Ok(())
     }
 }
 
@@ -318,6 +331,37 @@ mod tests {
             .contains("protected context"));
         drop(resumed);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_two_migration_preserves_existing_operation_history() {
+        let mut t = Test::new();
+        t.op(
+            "state.set",
+            json!({"key":"a","value":1}),
+            ContextLimits::default(),
+        )
+        .unwrap();
+        let original = t.journal.operations("run").unwrap();
+        let connection = rusqlite::Connection::open(&t.path).unwrap();
+        connection.execute_batch("DROP TABLE context_compactions; DROP TABLE context_messages; DROP TABLE shared_state; DROP TRIGGER memory_insert; DROP TABLE memory_search; DROP TABLE memory_facts; PRAGMA user_version=2;").unwrap();
+        drop(connection);
+        let reopened = Journal::open(&t.path).unwrap();
+        assert_eq!(reopened.operations("run").unwrap(), original);
+        let connection = rusqlite::Connection::open(&t.path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM memory_facts", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

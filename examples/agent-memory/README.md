@@ -1,8 +1,15 @@
 # Context, lexical memory, and shared state
 
-Run this captured local agent with a trusted host configuration granting the
-`demo` memory scope. Both the agent request and operator grant are required.
-The CLI invocation is documented in the repository agent guide.
+From the repository root, run the local fixture without paid credentials:
+
+```sh
+cd examples/agent-memory
+cargo run -- run main.js --request memory-demo --input null
+```
+
+The local `ondure.yaml` grants `demo`; both the agent request and operator grant
+are required. Repeat with another request ID to observe shared state between runs.
+Replay uses the printed run ID (`cargo run -- replay <run-id>`).
 
 `ctx.context.add({role, content})` returns `{messages, archived}` and
 `ctx.context.messages()` returns active messages. Context belongs to the run.
@@ -10,7 +17,10 @@ The default limits are 128 messages and 256 KiB of serialized message bytes;
 compaction archives the oldest eligible messages, preserving all system messages
 and the most recent 16 messages. Oversized protected context is rejected and its
 mutation is rolled back. Compaction decisions and removed messages remain in
-SQLite. This is deterministic removal, without model-generated summaries.
+SQLite. Configure these limits with trusted `context_limits` in `ondure.yaml`
+(`max_messages`, `max_bytes`, `recent_messages`). All must be positive, and
+`recent_messages` cannot exceed `max_messages`. This is deterministic removal,
+without model-generated summaries.
 
 `remember(text, {scope, metadata})` stores lexical facts; `recall(query,
 {scope, limit})` searches SQLite FTS5 (default 10, maximum 100), returning
