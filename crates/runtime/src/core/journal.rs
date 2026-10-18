@@ -671,13 +671,20 @@ mod tests {
             let operator = std::thread::spawn(move || {
                 let mut journal = Journal::open(&other_path).unwrap();
                 other_barrier.wait();
-                journal.answer_wait("run", 0, "operator")
+                journal.answer_wait("run", 0, r#""operator""#)
             });
             let mut journal = Journal::open(&path).unwrap();
             barrier.wait();
-            let winner = journal.timeout_wait("run", 0, "timeout", 0).unwrap();
+            let winner = journal.timeout_wait("run", 0, r#""timeout""#, 0).unwrap();
             let operator_won = operator.join().unwrap().is_ok();
-            assert_eq!(winner, if operator_won { "operator" } else { "timeout" });
+            assert_eq!(
+                winner,
+                if operator_won {
+                    r#""operator""#
+                } else {
+                    r#""timeout""#
+                }
+            );
             assert_eq!(
                 journal.waits("run").unwrap()[0].answer.as_deref(),
                 Some(winner.as_str())

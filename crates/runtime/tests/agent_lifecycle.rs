@@ -35,6 +35,9 @@ fn invokes_only_default_agent_after_evaluation_with_persisted_input() {
     )
     .unwrap();
     assert_eq!(run.stdout, "Ada\ndone\n");
+    let waits = Journal::open(&p.journal()).unwrap().waits(&run.id).unwrap();
+    assert_eq!(waits[0].kind, "timer");
+    assert_eq!(waits[0].answer.as_deref(), Some("null"));
     fs::remove_file(p.0.join("main.js")).unwrap();
     assert_eq!(
         replay_run(&p.journal(), &run.id, None).unwrap().stdout,
@@ -158,11 +161,20 @@ fn relative_sleep_parks_and_reuses_recorded_deadline_after_restart() {
     let mut journal = Journal::open(&p.journal()).unwrap();
     let wait = journal.waits(&run.id).unwrap().remove(0);
     assert!(wait.wake_at.is_some());
-    // Drive the persisted timer backend explicitly: the test verifies replay,
-    // not whether host scheduling and synchronous commits finish within 30ms.
+    // Wake through the scheduler without a wall-clock race. Editing wake_at
+    // alone would conflict with the separately recorded wait.deadline result.
+    // Real deadline readiness is covered by the zero-duration agent above and
+    // parking::future_timer_parks_and_only_wakes_after_its_persisted_deadline.
     journal.answer_wait(&run.id, wait.seq, "null").unwrap();
-    let output = replay_run(&p.journal(), &run.id, None).unwrap();
+    let mut outcomes = wake_ready(&p.journal()).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    let output = outcomes.remove(0).result.unwrap();
+    assert_eq!(output.status, "done");
     assert_eq!(journal.waits(&run.id).unwrap()[0].wake_at, wait.wake_at);
+    assert_eq!(
+        journal.waits(&run.id).unwrap()[0].answer.as_deref(),
+        Some("null")
+    );
     assert_eq!(output.stdout, "before\nafter\n");
     assert_eq!(
         Journal::open(&p.journal())
