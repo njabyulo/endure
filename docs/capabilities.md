@@ -23,10 +23,15 @@ never resolved values. The capability layer does not yet dispatch configured
 tools, memory, children, or provider requests; subsequent adapters must invoke
 the same checks before dispatch.
 
-Agent declarations request `Capabilities`; their effective authority is the
-intersection of those requests and operator grants. Empty requests grant
-nothing, and requests cannot elevate legacy broad network policy. The subsequent agent-lifecycle layer applies this host boundary before invoking a handler; this layer supplies the host boundary and tests its intersection. Ordinary scripts
-using scoped configuration receive the configured operator grants directly.
+This layer supplies and tests the host's capability-intersection boundary. It
+does not yet provide agent declarations or call `request_capabilities` from a
+production entrypoint. Ordinary scripts using scoped configuration receive the
+configured operator grants directly.
+
+The subsequent agent-lifecycle layer will connect agent declarations to this
+boundary before invoking their handlers. In that layer, effective authority
+will be the intersection of requested capabilities and operator grants: empty
+requests grant nothing, and requests cannot elevate legacy broad network policy.
 
 Network grants are canonical HTTP(S) origins: scheme, host, and nondefault port,
 without a trailing slash, path, credentials, query, or fragment. Granting one
