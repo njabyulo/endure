@@ -69,3 +69,7 @@ The transport and lifecycle follow the supported portions of the official
 [lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle),
 and [tools specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
 Try the [local fixture](../examples/mcp/README.md).
+
+Credentialed MCP endpoints require HTTPS, except exact loopback hosts (`localhost`,
+IPv4 loopback addresses, and IPv6 `::1`) for local development. Credentials are
+rejected if reflected in JSON strings, keys, numbers, booleans, or null values.

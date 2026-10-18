@@ -54,6 +54,17 @@ impl McpServerConfig {
         {
             return Err("MCP credential must name a configured environment reference".into());
         }
+        if self.credential.is_some() && url.scheme() != "https" {
+            let loopback = match url.host() {
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+                None => false,
+            };
+            if !loopback {
+                return Err("credentialed MCP endpoints must use HTTPS except on loopback".into());
+            }
+        }
         for (alias, tool) in &self.tools {
             if alias.is_empty()
                 || alias.len() > 128
@@ -412,7 +423,7 @@ fn contains_secret(value: &Value, secret: &str) -> bool {
         Value::Object(values) => values
             .iter()
             .any(|(key, v)| key.contains(secret) || contains_secret(v, secret)),
-        _ => false,
+        Value::Number(_) | Value::Bool(_) | Value::Null => value.to_string().contains(secret),
     }
 }
 fn validate_tool_result(result: &Value) -> Result<(), String> {
@@ -498,11 +509,17 @@ mod tests {
                                 } else {
                                     json!({"type":"object","properties":{"name":{"type":"string","maxLength":20}},"required":["name"],"additionalProperties":false})
                                 };
-                                json!({"tools":[{"name":"greet","inputSchema":schema,"outputSchema":{"type":"object","properties":{"greeting":{"type":"string"}},"required":["greeting"],"additionalProperties":false}}]})
+                                let mut tool = json!({"name":"greet","inputSchema":schema,"outputSchema":{"type":"object","properties":{"greeting":{"type":"string"}},"required":["greeting"],"additionalProperties":false}});
+                                if mode == "numeric_credential_echo" {
+                                    tool.as_object_mut().unwrap().remove("outputSchema");
+                                }
+                                json!({"tools":[tool]})
                             }
                             "tools/call" => {
                                 if mode == "oversized" {
                                     json!({"content":[{"type":"text","text":"x".repeat(MAX_OPERATION_RESULT_BYTES+1)}]})
+                                } else if mode == "numeric_credential_echo" {
+                                    json!({"content":[],"structuredContent":{"token":123456789}})
                                 } else if mode == "credential_echo" {
                                     json!({"content":[{"type":"text","text":"fixture-private-token-never-record"}],"structuredContent":{"greeting":"fixture-private-token-never-record"}})
                                 } else if mode == "bad_output" {
@@ -949,7 +966,7 @@ mod tests {
     }
     #[test]
     fn credentials_stay_in_host_and_echoed_secrets_never_enter_journal() {
-        for mode in ["json", "credential_echo"] {
+        for mode in ["json", "credential_echo", "numeric_credential_echo"] {
             let fixture = Fixture::new(mode);
             let (directory, _, mut config) = agent_project(
                 &fixture,
@@ -964,7 +981,11 @@ mod tests {
                 serde_json::to_vec(&config).unwrap(),
             )
             .unwrap();
-            let secret = "fixture-private-token-never-record";
+            let secret = if mode == "numeric_credential_echo" {
+                "123456789"
+            } else {
+                "fixture-private-token-never-record"
+            };
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -996,7 +1017,7 @@ mod tests {
                 .unwrap()
                 .contains(secret));
             assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
-            if mode == "credential_echo" {
+            if mode.ends_with("credential_echo") {
                 assert!(journal.operations("run").unwrap()[0]
                     .result
                     .as_ref()
@@ -1006,5 +1027,45 @@ mod tests {
             drop(journal);
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+    #[test]
+    fn credentialed_endpoints_require_https_except_exact_loopback_hosts() {
+        let mut config = HostConfig::default();
+        config.credentials.insert("mcp".into(), "MCP_TOKEN".into());
+        for endpoint in [
+            "http://example.com/mcp",
+            "http://192.0.2.1/mcp",
+            "http://localhost.example.com/mcp",
+        ] {
+            let server = McpServerConfig {
+                endpoint: endpoint.into(),
+                credential: Some("mcp".into()),
+                ..Default::default()
+            };
+            assert!(
+                server.validate(&config).unwrap_err().contains("HTTPS"),
+                "{endpoint}"
+            );
+        }
+        for endpoint in [
+            "https://example.com/mcp",
+            "http://127.0.0.1/mcp",
+            "http://127.10.0.1/mcp",
+            "http://[::1]/mcp",
+            "http://localhost/mcp",
+        ] {
+            let server = McpServerConfig {
+                endpoint: endpoint.into(),
+                credential: Some("mcp".into()),
+                ..Default::default()
+            };
+            assert!(server.validate(&config).is_ok(), "{endpoint}");
+        }
+        assert!(McpServerConfig {
+            endpoint: "http://example.com/mcp".into(),
+            ..Default::default()
+        }
+        .validate(&config)
+        .is_ok());
     }
 }
