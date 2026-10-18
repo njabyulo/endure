@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 const MAX_CONTEXT_MESSAGES: usize = 10_000;
 const MAX_CONTEXT_BYTES: usize = MAX_OPERATION_RESULT_BYTES / 2;
 
+/// Trusted bounds on active context; archives remain available for replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ContextLimits {
@@ -26,6 +27,7 @@ impl Default for ContextLimits {
 }
 
 impl ContextLimits {
+    /// Reject settings whose full context snapshot cannot fit a durable outcome.
     pub fn validate(&self) -> Result<(), String> {
         if self.max_messages == 0 || self.max_bytes == 0 || self.recent_messages == 0 {
             return Err("context limits must be positive".into());
@@ -43,6 +45,10 @@ impl ContextLimits {
         Ok(())
     }
 }
+
+/// Additive lookup optimization, also installed when reopening schema-3 journals.
+pub(crate) const INDEXES: &str =
+    "CREATE INDEX IF NOT EXISTS context_messages_active ON context_messages(run_id, archived, id);";
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE memory_facts (id INTEGER PRIMARY KEY, scope TEXT NOT NULL, text TEXT NOT NULL, metadata TEXT NOT NULL);
@@ -122,9 +128,9 @@ pub(crate) fn execute(
                 )
                 .map_err(db)?;
             }
-            Ok(
-                json!({"messages":messages.into_iter().filter(|(id,_)|!archived.contains(id)).map(|(_,v)|v).collect::<Vec<_>>(),"archived":archived.len()}),
-            )
+            // Persist only acknowledgement counts. Callers request a full,
+            // replayable snapshot explicitly with context.messages().
+            Ok(json!({"count":count,"archived":archived.len()}))
         }
         "context.messages" => Ok(json!(messages(tx, run)?
             .into_iter()
@@ -309,12 +315,13 @@ mod tests {
                 )
                 .unwrap();
         }
-        let encoded = json!({"Ok":result}).to_string().len();
-        assert!(encoded > MAX_CONTEXT_BYTES - 256);
-        assert!(encoded < MAX_OPERATION_RESULT_BYTES);
+        assert_eq!(result, json!({"count":3,"archived":0}));
+        assert!(json!({"Ok":result}).to_string().len() < 96);
         let messages = t.op("context.messages", json!({}), limits).unwrap();
         assert_eq!(messages.as_array().unwrap().len(), 3);
-        assert!(json!({"Ok":messages}).to_string().len() < MAX_OPERATION_RESULT_BYTES);
+        let encoded_messages = json!({"Ok":messages}).to_string().len();
+        assert!(encoded_messages > MAX_CONTEXT_BYTES - 256);
+        assert!(encoded_messages < MAX_OPERATION_RESULT_BYTES);
         let compacted = t
             .op(
                 "context.add",
@@ -331,6 +338,51 @@ mod tests {
                 .unwrap()
                 .len()
                 < MAX_OPERATION_RESULT_BYTES / 2
+        );
+    }
+
+    #[test]
+    fn context_add_records_compact_acknowledgements_and_reopen_adds_lookup_index() {
+        let mut t = Test::new();
+        for _ in 0..32 {
+            t.op(
+                "context.add",
+                json!({"message":{"role":"user","content":"x".repeat(1024)}}),
+                ContextLimits::default(),
+            )
+            .unwrap();
+        }
+        let history = t.journal.operations("run").unwrap();
+        assert!(history
+            .iter()
+            .all(|op| op.result.as_ref().unwrap().len() < 96));
+        assert_eq!(
+            serde_json::from_str::<Value>(history[31].result.as_ref().unwrap()).unwrap(),
+            json!({"Ok":{"count":32,"archived":0}})
+        );
+        let connection = rusqlite::Connection::open(&t.path).unwrap();
+        connection
+            .execute("DROP INDEX context_messages_active", [])
+            .unwrap();
+        let reopened = Journal::open(&t.path).unwrap();
+        assert_eq!(reopened.operations("run").unwrap(), history);
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            3
+        );
+        let connection = rusqlite::Connection::open(&t.path).unwrap();
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='context_messages_active'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+        let detail: String = connection.query_row("EXPLAIN QUERY PLAN SELECT id,message FROM context_messages WHERE run_id=?1 AND archived=0 ORDER BY id", ["run"], |row|row.get(3)).unwrap();
+        assert!(detail.contains("context_messages_active"), "{detail}");
+        assert_eq!(
+            t.op("context.messages", json!({}), ContextLimits::default())
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            32
         );
     }
 

@@ -11,8 +11,9 @@ The local `ondure.yaml` grants `demo`; both the agent request and operator grant
 are required. Repeat with another request ID to observe shared state between runs.
 Replay uses the printed run ID (`cargo run -- replay <run-id>`).
 
-`ctx.context.add({role, content})` returns `{messages, archived}` and
-`ctx.context.messages()` returns active messages. Context belongs to the run.
+`ctx.context.add({role, content})` returns `{count, archived}` without copying
+all active messages into each acknowledgement. `ctx.context.messages()` explicitly
+returns and records a full snapshot of active messages. Context belongs to the run.
 The default limits are 128 messages and 256 KiB of serialized message bytes;
 compaction archives the oldest eligible messages, preserving all system messages
 and the most recent 16 messages. Oversized protected context is rejected and its

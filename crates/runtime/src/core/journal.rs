@@ -156,6 +156,7 @@ impl Journal {
             transaction.execute_batch(super::memory::SCHEMA)?;
             transaction.pragma_update(None, "user_version", 3)?;
         }
+        transaction.execute_batch(super::memory::INDEXES)?;
         transaction.commit()?;
         Ok(Self { connection })
     }

@@ -41,7 +41,7 @@ impl Drop for Project {
 fn awaited_native_memory_and_state_replay_without_duplicate_writes() {
     let p = Project::new(
         r#"import {agent} from 'ondure'; export default agent('memory',{capabilities:{memory_scopes:['team']}},async ctx=>{
- console.log((await ctx.context.add({role:'system',content:'instructions'})).messages.length);
+ console.log((await ctx.context.add({role:'system',content:'instructions'})).count);
  console.log((await ctx.context.messages()).length);
  console.log((await ctx.memory.remember('olive trees',{scope:'team'})).scope);
  console.log((await ctx.memory.recall('olive',{scope:'team'})).length);
