@@ -48,6 +48,7 @@ pub fn diff_runs(path: &Path, first: &str, second: &str) -> Result<Value, String
         "stderr",
         "attempts",
         "waits",
+        "resources",
     ] {
         if a[field] != b[field] {
             metadata.push(json!({"field": field, "before": a[field], "after": b[field]}));

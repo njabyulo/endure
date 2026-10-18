@@ -47,3 +47,28 @@ fn compares_recorded_outcomes_without_dispatch_or_exposing_snapshot_credentials(
     drop(journal);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn resource_only_changes_are_reported() {
+    let path = std::env::temp_dir().join(format!(
+        "ondure-resource-diff-{}.sqlite3",
+        uuid::Uuid::new_v4()
+    ));
+    let mut journal = Journal::open(&path).unwrap();
+    for id in ["a", "b"] {
+        journal.create_run(id, None, "hash", "input", "{}").unwrap();
+    }
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute("INSERT INTO resource_reservations(run_id,seq,category,tokens,micros,state,admitted_at,input_price,output_price) VALUES('b',0,'model',8,1,'settled',0,0,0)", []).unwrap();
+    let diff = diff_runs(&path, "a", "b").unwrap();
+    assert_eq!(diff["identical"], false);
+    assert!(diff["operations"].as_array().unwrap().is_empty());
+    assert!(diff["metadata"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value["field"] == "resources"));
+    drop(connection);
+    drop(journal);
+    std::fs::remove_file(path).unwrap();
+}
