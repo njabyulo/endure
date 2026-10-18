@@ -72,3 +72,49 @@ fn resource_only_changes_are_reported() {
     drop(journal);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn matching_approvals_and_accounting_ignore_record_ownership_and_timestamps() {
+    let path = std::env::temp_dir().join(format!(
+        "ondure-semantic-diff-{}.sqlite3",
+        uuid::Uuid::new_v4()
+    ));
+    let mut journal = Journal::open(&path).unwrap();
+    for id in ["a", "b"] {
+        journal.create_run(id, None, "hash", "input", "{}").unwrap();
+        journal
+            .intents(
+                id,
+                &[OpIntent {
+                    seq: 0,
+                    name: "wait.approval".into(),
+                    args_digest: "args".into(),
+                    args_json: Some("{}".into()),
+                    policy: "safe".into(),
+                }],
+            )
+            .unwrap();
+        journal.park_wait(id, 0, "approval", None, "{}").unwrap();
+        journal.answer_wait(id, 0, "true").unwrap();
+        journal.complete(id, 0, r#"{"Ok":true}"#).unwrap();
+        journal.finish_run(id, "done", "", "").unwrap();
+    }
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    for (id, start) in [("a", 1000), ("b", 3000)] {
+        connection
+            .execute(
+                "UPDATE run_resources SET started_at=?2,deadline_at=?2+1000 WHERE run_id=?1",
+                rusqlite::params![id, start],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO resource_reservations(run_id,seq,category,tokens,micros,state,admitted_at,input_price,output_price) VALUES(?1,0,'tool',5,2,'settled',?2,0,0)", rusqlite::params![id,start]).unwrap();
+    }
+    assert_eq!(diff_runs(&path, "a", "b").unwrap()["identical"], true);
+    assert_ne!(
+        inspect_run(&path, "a").unwrap()["waits"],
+        inspect_run(&path, "b").unwrap()["waits"]
+    );
+    drop(connection);
+    drop(journal);
+    std::fs::remove_file(path).unwrap();
+}

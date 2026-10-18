@@ -11,7 +11,7 @@ cargo run -p ondure -- replay inspect-a
 
 Use fresh run IDs for a new pair. These commands share `.ondure/journal.sqlite3`;
 `--journal PATH` selects another database. `diff` compares recorded operations by
-registration sequence and reports metadata changes. It does no model or tool
+registration sequence and reports metadata changes. Wait ownership and accounting database IDs/admission timestamps are excluded from comparison; elapsed deadline durations and conservative totals remain included. Raw inspection retains all fields. It does no model or tool
 work. An identical comparison describes recorded data, not external effect
 identity or provider equivalence. Replay verifies the original captured history
 and can resume supported unfinished operations; it does not fork or override it.

@@ -50,11 +50,49 @@ pub fn diff_runs(path: &Path, first: &str, second: &str) -> Result<Value, String
         "waits",
         "resources",
     ] {
-        if a[field] != b[field] {
-            metadata.push(json!({"field": field, "before": a[field], "after": b[field]}));
+        let before = comparable(field, &a[field]);
+        let after = comparable(field, &b[field]);
+        if before != after {
+            metadata.push(json!({"field": field, "before": before, "after": after}));
         }
     }
     Ok(
         json!({"run_a": first, "run_b": second, "identical": changes.is_empty() && metadata.is_empty(), "operations": changes, "metadata": metadata}),
     )
+}
+
+// Ownership and database insertion timestamps identify records, not differences
+// in outcomes. Full values remain available through inspect_run.
+fn comparable(field: &str, value: &Value) -> Value {
+    let mut value = value.clone();
+    if field == "waits" {
+        if let Some(waits) = value.as_array_mut() {
+            for wait in waits {
+                if let Some(wait) = wait.as_object_mut() {
+                    wait.remove("run_id");
+                }
+            }
+        }
+    } else if field == "resources" {
+        if let Some(report) = value.as_object_mut() {
+            let duration = report
+                .get("deadline_at")
+                .and_then(Value::as_i64)
+                .zip(report.get("started_at").and_then(Value::as_i64))
+                .and_then(|(deadline, start)| deadline.checked_sub(start));
+            report.remove("started_at");
+            report.remove("deadline_at");
+            report.insert("elapsed_deadline_ms".into(), json!(duration));
+            if let Some(reservations) = report.get_mut("reservations").and_then(Value::as_array_mut)
+            {
+                for reservation in reservations {
+                    if let Some(row) = reservation.as_object_mut() {
+                        row.remove("id");
+                        row.remove("admitted_at");
+                    }
+                }
+            }
+        }
+    }
+    value
 }
