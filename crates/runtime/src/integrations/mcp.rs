@@ -826,6 +826,9 @@ mod tests {
             let methods = fixture.methods();
             // Deterministically model the dispatch-before-outcome-commit window.
             let connection = rusqlite::Connection::open(&journal).unwrap();
+            connection
+                .execute("DELETE FROM operations WHERE run_id='run' AND seq>0", [])
+                .unwrap();
             connection.execute("UPDATE operations SET state='pending',result=NULL,completion_order=NULL WHERE run_id='run' AND seq=0",[]).unwrap();
             connection.execute("UPDATE operation_attempts SET state='dispatched',outcome=NULL WHERE run_id='run'",[]).unwrap();
             connection

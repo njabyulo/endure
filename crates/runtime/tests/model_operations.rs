@@ -158,6 +158,7 @@ impl Project {
             [id],
         )
         .unwrap();
+        db.execute("DELETE FROM operations WHERE run_id=?1 AND seq>(SELECT seq FROM operations WHERE run_id=?1 AND name='model.call')",[id]).unwrap();
         db.execute("UPDATE operations SET state='pending',result=NULL,completion_order=NULL WHERE run_id=?1 AND name='model.call'",[id]).unwrap();
         if attempt {
             db.execute(

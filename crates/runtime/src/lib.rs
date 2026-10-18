@@ -42,3 +42,4 @@ pub use integrations::model::ModelConfig;
 
 pub use core::inspection::{diff_runs, inspect_run};
 pub use core::resources::{RateLimit, ResourceLimits};
+pub use integrations::children::{ChildAllocation, ChildConfig};

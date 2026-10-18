@@ -105,6 +105,8 @@ pub struct HostConfig {
     pub resources: crate::ResourceLimits,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp_servers: BTreeMap<String, crate::McpServerConfig>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, crate::integrations::children::ChildConfig>,
 }
 fn context_limits_default(value: &crate::ContextLimits) -> bool {
     *value == crate::ContextLimits::default()
@@ -113,6 +115,12 @@ impl HostConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.grants.validate()?;
         self.context_limits.validate()?;
+        for (name, child) in &self.agents {
+            if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+                return Err("invalid child agent name".into());
+            }
+            child.validate()?;
+        }
         if let Some(model) = &self.model {
             model.validate()?;
             if model

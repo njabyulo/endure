@@ -26,6 +26,7 @@ pub(crate) struct JsonJob {
     pub args: serde_json::Value,
     pub network_url: Option<String>,
     pub required_tool: Option<String>,
+    pub required_child: Option<String>,
     pub task: JsonTask,
 }
 
@@ -453,6 +454,9 @@ pub(crate) fn run(
             }
             if let Some(tool) = &job.required_tool {
                 state.require_tool(tool)?;
+            }
+            if let Some(child) = &job.required_child {
+                state.require_child_agent(child)?;
             }
             let model_job = job.name == "model.call";
             let blocked = if model_job {

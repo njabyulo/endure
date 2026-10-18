@@ -1,0 +1,9 @@
+grants:
+  child_agents: [reviewer]
+agents:
+  reviewer:
+    module: reviewer.ts
+    capabilities: {}
+    allocation:
+      tokens: 100
+      dollar_micros: 1000

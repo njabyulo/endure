@@ -41,6 +41,13 @@ impl HostState {
             None => Err("permission denied: net".into()),
         }
     }
+    pub(crate) fn require_child_agent(&self, name: &str) -> Result<(), String> {
+        self.effective_capabilities
+            .borrow()
+            .as_ref()
+            .ok_or("permission denied: child agent")?
+            .require_child_agent(name)
+    }
     pub(crate) fn require_tool(&self, tool: &str) -> Result<(), String> {
         self.effective_capabilities
             .borrow()
@@ -327,7 +334,9 @@ pub fn run_request_with_limits(
     input: &str,
     limits: limits::RunLimits,
 ) -> Result<crate::RunRecord, HostError> {
-    run_request_configuration(policy, None, graph, path, request_id, input, limits)
+    run_request_configuration(
+        policy, None, graph, path, request_id, input, limits, None, 0,
+    )
 }
 
 /// Start or rejoin a request under persisted scoped operator grants.
@@ -347,9 +356,37 @@ pub fn run_request_with_config(
         request_id,
         input,
         limits,
+        None,
+        0,
     )
 }
 
+pub(crate) fn run_child_request(
+    config: &HostConfig,
+    graph: &modules::ModuleGraph,
+    path: &std::path::Path,
+    request_id: &str,
+    input: &str,
+    children: std::collections::BTreeMap<String, modules::ModuleGraph>,
+    depth: usize,
+) -> Result<crate::RunRecord, HostError> {
+    run_request_configuration(
+        &Policy::default(),
+        Some(config),
+        graph,
+        path,
+        request_id,
+        input,
+        limits::RunLimits {
+            cpu_ms: 1000,
+            heap_mb: 128,
+        },
+        Some(children),
+        depth,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_request_configuration(
     policy: &Policy,
     config: Option<&HostConfig>,
@@ -358,6 +395,8 @@ fn run_request_configuration(
     request_id: &str,
     input: &str,
     limits: limits::RunLimits,
+    captured_children: Option<std::collections::BTreeMap<String, modules::ModuleGraph>>,
+    child_depth: usize,
 ) -> Result<crate::RunRecord, HostError> {
     let fail = |message: String| HostError {
         filename: graph.filename.clone(),
@@ -405,9 +444,18 @@ fn run_request_configuration(
         return journal.get_run(&run.id).map_err(|e| fail(e.to_string()));
     }
     let id = crate::new_run_id();
-    let session =
-        Session::create_request_config(path, &id, policy, graph, Some(request_id), input, config)
-            .map_err(fail)?;
+    let session = Session::create_captured_request(
+        path,
+        &id,
+        policy,
+        graph,
+        Some(request_id),
+        input,
+        config,
+        captured_children,
+        child_depth,
+    )
+    .map_err(fail)?;
     execute(
         policy,
         &graph.filename,
