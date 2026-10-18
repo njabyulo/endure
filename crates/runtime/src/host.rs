@@ -7,17 +7,49 @@
 use crate::{
     core::{durability::Session, embedding, event_loop, execution, limits, microtasks, modules},
     integrations::{io, networking, timers},
-    Policy,
+    Capabilities, HostConfig, Policy,
 };
 use std::{cell::RefCell, fmt};
 
 pub(crate) struct HostState {
     pub(crate) policy: Policy,
+    pub(crate) host_config: Option<HostConfig>,
+    pub(crate) effective_capabilities: RefCell<Option<Capabilities>>,
     pub(crate) stdout: RefCell<String>,
     pub(crate) stderr: RefCell<String>,
     pub(crate) operations: RefCell<event_loop::Operations>,
     pub(crate) session: RefCell<Option<Session>>,
     pub(crate) rejections: microtasks::PromiseRejections,
+}
+
+impl HostState {
+    /// Called once by the agent entrypoint before invoking its handler.
+    #[allow(dead_code)] // The agent lifecycle layer consumes this boundary.
+    pub(crate) fn request_capabilities(&self, requested: &Capabilities) -> Result<(), String> {
+        requested.validate()?;
+        let grants = self
+            .host_config
+            .as_ref()
+            .map(|c| c.grants.clone())
+            .unwrap_or_default();
+        *self.effective_capabilities.borrow_mut() = Some(requested.intersection(&grants));
+        Ok(())
+    }
+    pub(crate) fn require_network(&self, url: &str) -> Result<(), String> {
+        match self.effective_capabilities.borrow().as_ref() {
+            Some(effective) => effective.require_network(url),
+            None if self.policy.allows_net() => Ok(()),
+            None => Err("permission denied: net".into()),
+        }
+    }
+    #[allow(dead_code)] // Consumed by the memory layer after stacking.
+    pub(crate) fn require_memory_scope(&self, scope: &str) -> Result<(), String> {
+        self.effective_capabilities
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| "permission denied: memory scope".to_string())?
+            .require_memory_scope(scope)
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -142,6 +174,40 @@ pub fn run_durable_with_limits(
     )
 }
 
+/// Execute with trusted, scoped operator configuration captured in the journal.
+pub fn run_durable_with_config(
+    config: &HostConfig,
+    graph: &modules::ModuleGraph,
+    journal: &std::path::Path,
+    run_id: &str,
+    limits: limits::RunLimits,
+) -> Result<RunOutput, HostError> {
+    let fail = |message| HostError {
+        filename: graph.filename.clone(),
+        message,
+        output: RunOutput::default(),
+    };
+    graph.verify_integrity().map_err(|e| fail(e.to_string()))?;
+    let policy = Policy::default();
+    let session = Session::create_request_config(
+        journal,
+        run_id,
+        &policy,
+        graph,
+        None,
+        serde_json::Value::Null,
+        Some(config),
+    )
+    .map_err(fail)?;
+    execute(
+        &policy,
+        &graph.filename,
+        Program::Module(graph),
+        Some(session),
+        limits,
+    )
+}
+
 /// Re-execute captured code, supplying recorded results in their original order.
 /// Unfinished safe operations may run live; completed effects are never reissued.
 pub fn replay_run(
@@ -255,12 +321,47 @@ pub fn run_request_with_limits(
     input: &str,
     limits: limits::RunLimits,
 ) -> Result<crate::RunRecord, HostError> {
+    run_request_configuration(policy, None, graph, path, request_id, input, limits)
+}
+
+/// Start or rejoin a request under persisted scoped operator grants.
+pub fn run_request_with_config(
+    config: &HostConfig,
+    graph: &modules::ModuleGraph,
+    path: &std::path::Path,
+    request_id: &str,
+    input: &str,
+    limits: limits::RunLimits,
+) -> Result<crate::RunRecord, HostError> {
+    run_request_configuration(
+        &Policy::default(),
+        Some(config),
+        graph,
+        path,
+        request_id,
+        input,
+        limits,
+    )
+}
+
+fn run_request_configuration(
+    policy: &Policy,
+    config: Option<&HostConfig>,
+    graph: &modules::ModuleGraph,
+    path: &std::path::Path,
+    request_id: &str,
+    input: &str,
+    limits: limits::RunLimits,
+) -> Result<crate::RunRecord, HostError> {
     let fail = |message: String| HostError {
         filename: graph.filename.clone(),
         message,
         output: RunOutput::default(),
     };
     graph.verify_integrity().map_err(|e| fail(e.to_string()))?;
+    if let Some(config) = config {
+        config.validate().map_err(fail)?;
+    }
     let input: serde_json::Value = serde_json::from_str(input).map_err(|e| fail(e.to_string()))?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| fail(e.to_string()))?;
@@ -269,8 +370,11 @@ pub fn run_request_with_limits(
     let _request_lease =
         crate::core::parking::RunLease::acquire(path, &format!("request:{request_id}"))
             .map_err(fail)?;
-    let identity =
-        crate::core::durability::digest(&serde_json::json!({"net": policy.net, "input": input}));
+    let mut identity = serde_json::json!({"net": policy.net, "input": input});
+    if let Some(config) = config {
+        identity["host_config"] = serde_json::to_value(config).map_err(|e| fail(e.to_string()))?;
+    }
+    let identity = crate::core::durability::digest(&identity);
     if let Some(run) = journal
         .find_request(request_id)
         .map_err(|e| fail(e.to_string()))?
@@ -296,7 +400,8 @@ pub fn run_request_with_limits(
     }
     let id = crate::new_run_id();
     let session =
-        Session::create_request(path, &id, policy, graph, Some(request_id), input).map_err(fail)?;
+        Session::create_request_config(path, &id, policy, graph, Some(request_id), input, config)
+            .map_err(fail)?;
     execute(
         policy,
         &graph.filename,
@@ -320,12 +425,26 @@ fn execute(
     session: Option<Session>,
     limits: limits::RunLimits,
 ) -> Result<RunOutput, HostError> {
+    let config = session
+        .as_ref()
+        .and_then(|session| session.host_config.clone());
+    execute_config(policy, filename, program, session, limits, config)
+}
+
+fn execute_config(
+    policy: &Policy,
+    filename: &str,
+    program: Program<'_>,
+    session: Option<Session>,
+    limits: limits::RunLimits,
+    config: Option<HostConfig>,
+) -> Result<RunOutput, HostError> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return std::thread::scope(|threads| {
             let worker = std::thread::Builder::new()
                 .name("ondure-isolate".into())
                 .spawn_scoped(threads, || {
-                    run_on_thread(policy, filename, program, session, limits)
+                    run_on_thread(policy, filename, program, session, limits, config)
                 })
                 .map_err(|error| HostError {
                     filename: filename.into(),
@@ -341,7 +460,7 @@ fn execute(
             })
         });
     }
-    run_on_thread(policy, filename, program, session, limits)
+    run_on_thread(policy, filename, program, session, limits, config)
 }
 
 // Create, execute, and dispose both V8 and Tokio on the same host thread.
@@ -351,6 +470,7 @@ fn run_on_thread(
     program: Program<'_>,
     session: Option<Session>,
     limits: limits::RunLimits,
+    config: Option<HostConfig>,
 ) -> Result<RunOutput, HostError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -365,6 +485,8 @@ fn run_on_thread(
     isolate.set_host_import_module_dynamically_callback(modules::reject_dynamic_import);
     isolate.set_slot(HostState {
         policy: *policy,
+        effective_capabilities: RefCell::new(config.as_ref().map(|c| c.grants.clone())),
+        host_config: config,
         stdout: RefCell::new(String::new()),
         stderr: RefCell::new(String::new()),
         operations: RefCell::new(event_loop::Operations::default()),
@@ -451,6 +573,45 @@ fn run_on_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_requests_cannot_elevate_grants_or_legacy_net() {
+        for config in [
+            None,
+            Some(HostConfig {
+                grants: Capabilities {
+                    tools: ["read".into()].into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        ] {
+            let state = HostState {
+                policy: Policy { net: true },
+                host_config: config,
+                effective_capabilities: RefCell::new(None),
+                stdout: RefCell::new(String::new()),
+                stderr: RefCell::new(String::new()),
+                operations: RefCell::new(event_loop::Operations::default()),
+                session: RefCell::new(None),
+                rejections: microtasks::PromiseRejections::default(),
+            };
+            state
+                .request_capabilities(&Capabilities {
+                    network_origins: ["https://example.com".into()].into(),
+                    tools: ["pay".into()].into(),
+                    memory_scopes: ["admin".into()].into(),
+                    child_agents: ["root".into()].into(),
+                })
+                .unwrap();
+            assert!(state.require_network("https://example.com").is_err());
+            assert!(state.require_memory_scope("admin").is_err());
+            let effective = state.effective_capabilities.borrow();
+            let effective = effective.as_ref().unwrap();
+            assert!(effective.require_tool("pay").is_err());
+            assert!(effective.require_child_agent("root").is_err());
+        }
+    }
 
     #[test]
     fn caught_error_is_success() {

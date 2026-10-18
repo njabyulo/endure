@@ -2,8 +2,9 @@ mod supervisor;
 
 use runtime::{
     approve_run_with_limits, journal_log, new_run_id, replay_run_with_limits,
-    run_durable_with_limits, run_request_with_limits, wake_ready_with_limits, HostError, Journal,
-    ModuleGraph, Policy, RunLimits, RunOutput,
+    run_durable_with_config, run_durable_with_limits, run_request_with_config,
+    run_request_with_limits, wake_ready_with_limits, HostConfig, HostError, Journal, ModuleGraph,
+    Policy, RunLimits, RunOutput,
 };
 use std::{
     error::Error,
@@ -132,12 +133,23 @@ fn run(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<(), Bo
             }
         }
         "run" => {
-            let policy = Policy::load(Path::new("ondure.yaml"))?;
+            let config = HostConfig::load_optional(Path::new("ondure.yaml"))?;
+            let policy = if config.is_none() {
+                Policy::load(Path::new("ondure.yaml"))?
+            } else {
+                Policy::default()
+            };
             let graph = ModuleGraph::load(Path::new(target.as_ref().ok_or(USAGE)?))?;
             if let Some(request) = request {
-                let run = match run_request_with_limits(
-                    &policy, &graph, &journal, &request, &input, limits,
-                ) {
+                let result = match &config {
+                    Some(config) => {
+                        run_request_with_config(config, &graph, &journal, &request, &input, limits)
+                    }
+                    None => {
+                        run_request_with_limits(&policy, &graph, &journal, &request, &input, limits)
+                    }
+                };
+                let run = match result {
                     Ok(run) => run,
                     Err(error) => {
                         write_output(&error.output)?;
@@ -164,9 +176,10 @@ fn run(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<(), Bo
                         id
                     }
                 };
-                emit(run_durable_with_limits(
-                    &policy, &graph, &journal, &id, limits,
-                ))?;
+                emit(match &config {
+                    Some(config) => run_durable_with_config(config, &graph, &journal, &id, limits),
+                    None => run_durable_with_limits(&policy, &graph, &journal, &id, limits),
+                })?;
                 report_parked(&journal, &id)?;
             }
         }

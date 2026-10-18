@@ -258,6 +258,11 @@ pub(crate) fn run(
                     .push((id, url));
                 continue;
             }
+            let allow_redirects = {
+                let state = scope.get_slot::<HostState>().expect("host state installed");
+                state.require_network(&url)?;
+                state.effective_capabilities.borrow().is_none()
+            };
             if let Some(session) = scope
                 .get_slot::<HostState>()
                 .expect("host state installed")
@@ -272,7 +277,7 @@ pub(crate) fn run(
             tasks.spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     cancellation.check()?;
-                    let result = networking::http_get(&url);
+                    let result = networking::http_get(&url, allow_redirects);
                     cancellation.check()?;
                     result
                 })

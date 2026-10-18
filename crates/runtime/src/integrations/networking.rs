@@ -20,18 +20,31 @@ fn fetch(
     mut return_value: v8::ReturnValue,
 ) {
     // Authorize before touching the URL, HTTP client, DNS, or any socket.
-    let allowed = scope
-        .get_slot::<HostState>()
-        .is_some_and(|state| state.policy.allows_net());
+    let allowed = scope.get_slot::<HostState>().is_some_and(|state| {
+        state
+            .effective_capabilities
+            .borrow()
+            .as_ref()
+            .map_or(state.policy.allows_net(), |caps| {
+                !caps.network_origins.is_empty()
+            })
+    });
     if !allowed {
         throw_error(scope, "permission denied: net");
         return;
     }
-
     let Some(url) = arguments.get(0).to_string(scope) else {
         return;
     };
     let url = url.to_rust_string_lossy(scope);
+    let authorization = scope
+        .get_slot::<HostState>()
+        .expect("host state installed")
+        .require_network(&url);
+    if let Err(error) = authorization {
+        throw_error(scope, &error);
+        return;
+    }
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         return;
     };
@@ -85,12 +98,20 @@ pub(crate) fn complete(
     resolver.resolve(scope, response.into());
 }
 
-pub(crate) fn http_get(url: &str) -> Result<(u16, String), String> {
-    let response = match ureq::get(url).timeout(HTTP_TIMEOUT).call() {
+pub(crate) fn http_get(url: &str, allow_redirects: bool) -> Result<(u16, String), String> {
+    let client = ureq::AgentBuilder::new()
+        .redirects(if allow_redirects { 5 } else { 0 })
+        .build();
+    let response = match client.get(url).timeout(HTTP_TIMEOUT).call() {
         Ok(response) | Err(ureq::Error::Status(_, response)) => response,
         Err(error) => return Err(error.to_string()),
     };
     let status = response.status();
+    if !allow_redirects && (300..400).contains(&status) && response.header("Location").is_some() {
+        return Err(
+            "permission denied: automatic redirects are disabled for scoped network access".into(),
+        );
+    }
     let mut bytes = Vec::new();
     response
         .into_reader()
