@@ -30,7 +30,7 @@ fn hundred_killed_runs_keep_every_acknowledged_result() {
         let (seen_tx, seen_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
         let server = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(15);
             for request in 0..2 {
                 let mut stream = loop {
                     match listener.accept() {
@@ -60,7 +60,7 @@ fn hundred_killed_runs_keep_every_acknowledged_result() {
                     stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n{\"hit\":1}").unwrap();
                 } else {
                     let _ = seen_tx.send(());
-                    let _ = stop_rx.recv_timeout(Duration::from_secs(5));
+                    let _ = stop_rx.recv_timeout(Duration::from_secs(15));
                 }
             }
         });
@@ -68,20 +68,37 @@ fn hundred_killed_runs_keep_every_acknowledged_result() {
         let mut child = Command::new(env!("CARGO_BIN_EXE_ondure"))
             .arg("__worker")
             .current_dir(&root)
-            .args(["run", "agent.js", "--run-id", &run_id, "--journal"])
+            // This test proves persistence, not the active-execution limit.
+            // Give shared CI hosts room for startup and journal synchronization.
+            .args([
+                "run",
+                "agent.js",
+                "--cpu-ms",
+                "5000",
+                "--run-id",
+                &run_id,
+                "--journal",
+            ])
             .arg(&journal_path)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let acknowledged = seen_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let acknowledged = seen_rx.recv_timeout(Duration::from_secs(15)).is_ok();
         let _ = child.kill();
-        child.wait().unwrap();
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
         let _ = stop_tx.send(());
         server.join().unwrap();
         assert!(
             acknowledged,
-            "run {iteration} never reached its await continuation"
+            "run {iteration} never reached its await continuation; status={status}; stderr={stderr}"
         );
         let journal = runtime::Journal::open(&journal_path).unwrap();
         let ops = journal.operations(&run_id).unwrap();
