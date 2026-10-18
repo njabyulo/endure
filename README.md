@@ -12,7 +12,7 @@ readiness or measured performance is claimed.
 ## Build and try
 
 ```sh
-cargo build --release --bin ondure
+cargo build --bin ondure
 python3 examples/model-operations/run.py
 python3 examples/standard-interfaces/run.py
 python3 examples/onboarding/run.py
