@@ -361,6 +361,9 @@ mod tests {
             json!({"Ok":{"count":32,"archived":0}})
         );
         let connection = rusqlite::Connection::open(&t.path).unwrap();
+        let version_before: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
         connection
             .execute("DROP INDEX context_messages_active", [])
             .unwrap();
@@ -370,7 +373,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                 .unwrap(),
-            3
+            version_before
         );
         let connection = rusqlite::Connection::open(&t.path).unwrap();
         assert_eq!(connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='context_messages_active'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
