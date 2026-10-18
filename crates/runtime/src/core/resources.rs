@@ -606,7 +606,14 @@ mod tests {
     #[test]
     fn dollar_admission_and_deadline_are_independent() {
         let (path, mut j) = journal();
-        let start = super::super::durability::epoch_millis().unwrap();
+        let start: i64 = j
+            .connection
+            .query_row(
+                "SELECT started_at FROM run_resources WHERE run_id='run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         let limits = ResourceLimits {
             dollar_limit_micros: Some(2),
             tool_estimate_micros: 3,
