@@ -76,7 +76,7 @@ pub struct AttemptRecord {
 }
 
 pub struct Journal {
-    connection: Connection,
+    pub(crate) connection: Connection,
 }
 
 impl Journal {
@@ -89,7 +89,7 @@ impl Journal {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: u32 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 3 {
+        if version > 4 {
             return Err(JournalError(format!(
                 "journal: unsupported schema version {version}"
             )));
@@ -157,6 +157,11 @@ impl Journal {
             transaction.pragma_update(None, "user_version", 3)?;
         }
         transaction.execute_batch(super::memory::INDEXES)?;
+        if version < 4 {
+            transaction.execute_batch(super::resources::SCHEMA)?;
+            transaction.pragma_update(None, "user_version", 4)?;
+        }
+
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -221,6 +226,11 @@ impl Journal {
             "INSERT INTO runs (id, request_id, code_hash, input_digest, graph, status)
              VALUES (?1, ?2, ?3, ?4, ?5, 'running')",
             params![id, request_id, code_hash, input_digest, graph],
+        )?;
+        let now = super::durability::epoch_millis().map_err(JournalError)?;
+        transaction.execute(
+            "INSERT INTO run_resources(run_id,started_at) VALUES(?1,?2)",
+            params![id, now],
         )?;
         let record = transaction.query_row(
             "SELECT id, request_id, code_hash, input_digest, graph, status, stdout, stderr
@@ -327,6 +337,9 @@ impl Journal {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (seq, result) in results {
+            super::resources::settle(&transaction, run_id, *seq, result).map_err(JournalError)?;
+        }
         write_completions(&transaction, run_id, results)?;
         transaction.commit()?;
         Ok(())
@@ -752,7 +765,7 @@ mod tests {
                 .park_wait("run", 1, "approval", None, "details")
                 .unwrap();
             journal.connection.execute_batch(
-                "DROP TABLE context_compactions; DROP TABLE context_messages; DROP TABLE shared_state; DROP TRIGGER memory_insert; DROP TABLE memory_search; DROP TABLE memory_facts; DROP TABLE operation_attempts; ALTER TABLE operations DROP COLUMN args_json; PRAGMA user_version = 0;"
+                "DROP TABLE resource_reservations; DROP TABLE run_resources; DROP TABLE context_compactions; DROP TABLE context_messages; DROP TABLE shared_state; DROP TRIGGER memory_insert; DROP TABLE memory_search; DROP TABLE memory_facts; DROP TABLE operation_attempts; ALTER TABLE operations DROP COLUMN args_json; PRAGMA user_version = 0;"
             ).unwrap();
         }
         let journal = Journal::open(&path).unwrap();
@@ -773,7 +786,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            3
+            4
         );
         drop(journal);
         std::fs::remove_file(path).unwrap();
