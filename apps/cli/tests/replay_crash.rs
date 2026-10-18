@@ -18,17 +18,20 @@ use std::{
 
 const DEADLINE: Duration = Duration::from_secs(15);
 
+static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct Directory(PathBuf);
 
 impl Directory {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "ondure-crash-replay-{}-{}",
+            "ondure-crash-replay-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
         Self(path)

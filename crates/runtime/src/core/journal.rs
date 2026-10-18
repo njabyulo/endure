@@ -39,6 +39,7 @@ pub struct OpIntent {
     pub seq: u64,
     pub name: String,
     pub args_digest: String,
+    pub args_json: Option<String>,
     pub policy: String,
 }
 
@@ -47,6 +48,7 @@ pub struct OpRecord {
     pub seq: u64,
     pub name: String,
     pub args_digest: String,
+    pub args_json: Option<String>,
     pub policy: String,
     pub state: String,
     pub result: Option<String>,
@@ -63,19 +65,38 @@ pub struct WaitRecord {
     pub details: String,
 }
 
+/// A dispatch boundary committed before invoking an external adapter.
+/// An interrupted attempt may have produced external effects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptRecord {
+    pub seq: u64,
+    pub attempt: u64,
+    pub state: String,
+    pub outcome: Option<String>,
+}
+
 pub struct Journal {
     connection: Connection,
 }
 
 impl Journal {
     pub fn open(path: &Path) -> Result<Self, JournalError> {
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", true)?;
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: u32 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version > 2 {
+            return Err(JournalError(format!(
+                "journal: unsupported schema version {version}"
+            )));
+        }
+        if version < 1 {
+            transaction.execute_batch(
+            "
              CREATE TABLE IF NOT EXISTS runs (
                  id TEXT PRIMARY KEY NOT NULL,
                  request_id TEXT UNIQUE,
@@ -110,9 +131,74 @@ impl Journal {
                  PRIMARY KEY(run_id, seq),
                  FOREIGN KEY(run_id, seq) REFERENCES operations(run_id, seq)
              );
-             COMMIT;",
+             ",
         )?;
+            transaction.pragma_update(None, "user_version", 1)?;
+        }
+        if version < 2 {
+            transaction.execute_batch(
+                "ALTER TABLE operations ADD COLUMN args_json TEXT;
+                 CREATE TABLE operation_attempts (
+                    run_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    attempt INTEGER NOT NULL CHECK(attempt >= 1),
+                    state TEXT NOT NULL CHECK(state IN ('dispatched', 'interrupted', 'completed')),
+                    outcome TEXT,
+                    PRIMARY KEY(run_id, seq, attempt),
+                    FOREIGN KEY(run_id, seq) REFERENCES operations(run_id, seq),
+                    CHECK((state = 'completed' AND outcome IS NOT NULL)
+                       OR (state != 'completed' AND outcome IS NULL))
+                );",
+            )?;
+            transaction.pragma_update(None, "user_version", 2)?;
+        }
+        transaction.commit()?;
         Ok(Self { connection })
+    }
+
+    /// Commit an attempt before external dispatch. A prior unfinished attempt is
+    /// ambiguous, even when the process died before making the actual request.
+    /// The caller must enforce the operation's recovery policy before retrying.
+    pub fn begin_attempt(&mut self, run_id: &str, seq: u64) -> Result<u64, JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seq = sequence(seq)?;
+        let state: String = transaction.query_row(
+            "SELECT state FROM operations WHERE run_id = ?1 AND seq = ?2",
+            params![run_id, seq],
+            |row| row.get(0),
+        )?;
+        if state != "pending" {
+            return Err(JournalError(
+                "journal: cannot dispatch completed operation".into(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE operation_attempts SET state = 'interrupted' WHERE run_id = ?1 AND seq = ?2 AND state = 'dispatched'",
+            params![run_id, seq])?;
+        let attempt: u64 = transaction.query_row(
+            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM operation_attempts WHERE run_id = ?1 AND seq = ?2",
+            params![run_id, seq], |row| row.get(0))?;
+        transaction.execute(
+            "INSERT INTO operation_attempts (run_id, seq, attempt, state) VALUES (?1, ?2, ?3, 'dispatched')",
+            params![run_id, seq, sequence(attempt)?])?;
+        transaction.commit()?;
+        Ok(attempt)
+    }
+
+    pub fn attempts(&self, run_id: &str) -> Result<Vec<AttemptRecord>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT seq, attempt, state, outcome FROM operation_attempts WHERE run_id = ?1 ORDER BY seq, attempt")?;
+        let records = statement.query_map([run_id], |row| {
+            Ok(AttemptRecord {
+                seq: row.get(0)?,
+                attempt: row.get(1)?,
+                state: row.get(2)?,
+                outcome: row.get(3)?,
+            })
+        })?;
+        records.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn create_run(
@@ -322,6 +408,7 @@ impl Journal {
     }
 
     /// Record the first answer. Repeating it is harmless; replacing it is rejected.
+    /// Approval answers must be JSON whose completion envelope fits the result limit.
     pub fn answer_wait(
         &mut self,
         run_id: &str,
@@ -332,11 +419,14 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let seq = sequence(seq)?;
-        let existing: Option<String> = transaction.query_row(
-            "SELECT answer FROM waits WHERE run_id = ?1 AND seq = ?2",
+        let (kind, existing): (String, Option<String>) = transaction.query_row(
+            "SELECT kind,answer FROM waits WHERE run_id = ?1 AND seq = ?2",
             params![run_id, seq],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        if kind == "approval" {
+            super::operations::approval_outcome(answer).map_err(JournalError)?;
+        }
         let changed = if let Some(existing) = existing {
             if existing != answer {
                 return Err(JournalError(format!(
@@ -357,7 +447,7 @@ impl Journal {
 
     pub fn operations(&self, run_id: &str) -> Result<Vec<OpRecord>, JournalError> {
         let mut statement = self.connection.prepare(
-            "SELECT seq, name, args_digest, policy, state, result, completion_order
+            "SELECT seq, name, args_digest, policy, state, result, completion_order, args_json
              FROM operations WHERE run_id = ?1 ORDER BY seq",
         )?;
         let records = statement.query_map([run_id], |row| {
@@ -365,6 +455,7 @@ impl Journal {
                 seq: row.get(0)?,
                 name: row.get(1)?,
                 args_digest: row.get(2)?,
+                args_json: row.get(7)?,
                 policy: row.get(3)?,
                 state: row.get(4)?,
                 result: row.get(5)?,
@@ -422,19 +513,26 @@ fn write_intents(
         let seq = sequence(intent.seq)?;
         let existing = transaction
             .query_row(
-                "SELECT name, args_digest, policy FROM operations WHERE run_id = ?1 AND seq = ?2",
+                "SELECT name, args_digest, policy, args_json FROM operations WHERE run_id = ?1 AND seq = ?2",
                 params![run_id, seq],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((name, args_digest, policy)) = existing {
-            if name != intent.name || args_digest != intent.args_digest || policy != intent.policy {
+        if let Some((name, args_digest, policy, args_json)) = existing {
+            if name != intent.name
+                || args_digest != intent.args_digest
+                || policy != intent.policy
+                || args_json
+                    .as_ref()
+                    .is_some_and(|args| Some(args) != intent.args_json.as_ref())
+            {
                 return Err(JournalError(format!(
                     "journal: intent mismatch at operation {}",
                     intent.seq
@@ -443,9 +541,16 @@ fn write_intents(
             continue;
         }
         transaction.execute(
-            "INSERT INTO operations (run_id, seq, name, args_digest, policy, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
-            params![run_id, seq, intent.name, intent.args_digest, intent.policy],
+            "INSERT INTO operations (run_id, seq, name, args_digest, policy, state, args_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+            params![
+                run_id,
+                seq,
+                intent.name,
+                intent.args_digest,
+                intent.policy,
+                intent.args_json
+            ],
         )?;
     }
     Ok(())
@@ -471,6 +576,11 @@ fn write_completions(
             }
         } else {
             transaction.execute(
+                "UPDATE operation_attempts SET state = 'completed', outcome = ?3
+                 WHERE run_id = ?1 AND seq = ?2 AND state = 'dispatched'",
+                params![run_id, seq, result],
+            )?;
+            transaction.execute(
                 "UPDATE operations SET state = 'completed', result = ?3,
                          completion_order = (SELECT COALESCE(MAX(completion_order), -1) + 1
                                              FROM operations WHERE run_id = ?1)
@@ -495,6 +605,7 @@ mod tests {
             seq,
             name: "fetch".into(),
             args_digest: format!("args-{seq}"),
+            args_json: None,
             policy: "net".into(),
         }
     }
@@ -503,6 +614,108 @@ mod tests {
         journal
             .create_run("run", Some("request"), "hash", "input", "graph")
             .unwrap();
+    }
+
+    #[test]
+    fn migrates_unversioned_journals_without_replacing_history() {
+        let path = temporary_path();
+        {
+            let mut journal = Journal::open(&path).unwrap();
+            create(&mut journal);
+            journal.intents("run", &[intent(0), intent(1)]).unwrap();
+            journal.complete("run", 0, "original").unwrap();
+            journal
+                .park_wait("run", 1, "approval", None, "details")
+                .unwrap();
+            journal.connection.execute_batch(
+                "DROP TABLE operation_attempts; ALTER TABLE operations DROP COLUMN args_json; PRAGMA user_version = 0;"
+            ).unwrap();
+        }
+        let journal = Journal::open(&path).unwrap();
+        assert_eq!(
+            journal.get_run("run").unwrap().request_id.as_deref(),
+            Some("request")
+        );
+        let operations = journal.operations("run").unwrap();
+        assert_eq!(operations[0].result.as_deref(), Some("original"));
+        assert_eq!(operations[0].args_json, None);
+        let waits = journal.waits("run").unwrap();
+        assert_eq!(waits.len(), 1);
+        assert_eq!(waits[0].details, "details");
+        assert_eq!(operations[1].state, "pending");
+        assert!(journal.attempts("run").unwrap().is_empty());
+        assert_eq!(
+            journal
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn refuses_future_schema_without_changing_it() {
+        let path = temporary_path();
+        let connection = Connection::open(&path).unwrap();
+        connection.pragma_update(None, "user_version", 99).unwrap();
+        drop(connection);
+        assert!(Journal::open(&path)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unsupported schema version 99"));
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            99
+        );
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dispatch_attempts_survive_restart_and_complete_with_outcomes() {
+        let path = temporary_path();
+        {
+            let mut journal = Journal::open(&path).unwrap();
+            create(&mut journal);
+            journal.intents("run", &[intent(0)]).unwrap();
+            assert_eq!(journal.begin_attempt("run", 0).unwrap(), 1);
+        }
+        let mut journal = Journal::open(&path).unwrap();
+        assert_eq!(journal.attempts("run").unwrap()[0].state, "dispatched");
+        assert_eq!(journal.begin_attempt("run", 0).unwrap(), 2);
+        journal.complete("run", 0, "result").unwrap();
+        let attempts = journal.attempts("run").unwrap();
+        assert_eq!(attempts[0].state, "interrupted");
+        assert_eq!(attempts[1].state, "completed");
+        assert_eq!(attempts[1].outcome.as_deref(), Some("result"));
+        assert!(journal.begin_attempt("run", 0).is_err());
+        journal.complete("run", 0, "result").unwrap();
+        assert_eq!(journal.attempts("run").unwrap(), attempts);
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn outcome_commit_failure_preserves_ambiguous_attempt() {
+        let path = temporary_path();
+        let mut journal = Journal::open(&path).unwrap();
+        create(&mut journal);
+        journal.intents("run", &[intent(0)]).unwrap();
+        journal.begin_attempt("run", 0).unwrap();
+        journal.connection.execute_batch(
+            "CREATE TRIGGER fail_outcome BEFORE UPDATE ON operations BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+        ).unwrap();
+        assert!(journal.complete("run", 0, "result").is_err());
+        assert_eq!(journal.operations("run").unwrap()[0].state, "pending");
+        assert_eq!(journal.attempts("run").unwrap()[0].state, "dispatched");
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -670,14 +883,14 @@ mod tests {
                 .unwrap();
             assert_eq!(journal.get_run("run").unwrap().status, "running");
             journal.finish_run("run", "parked", "", "").unwrap();
-            assert!(journal.answer_wait("run", 0, "yes").unwrap());
+            assert!(journal.answer_wait("run", 0, "true").unwrap());
         }
         let mut journal = Journal::open(&path).unwrap();
-        assert!(!journal.answer_wait("run", 0, "yes").unwrap());
-        assert!(journal.answer_wait("run", 0, "no").is_err());
+        assert!(!journal.answer_wait("run", 0, "true").unwrap());
+        assert!(journal.answer_wait("run", 0, "false").is_err());
         let waits = journal.waits("run").unwrap();
         assert_eq!(waits.len(), 2);
-        assert_eq!(waits[0].answer.as_deref(), Some("yes"));
+        assert_eq!(waits[0].answer.as_deref(), Some("true"));
         assert_eq!(waits[0].details, "send email");
         assert!(journal
             .park_wait("run", 0, "approval", None, "delete file")

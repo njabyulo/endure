@@ -262,8 +262,13 @@ fn event_loop_finishes_timers_and_exits_when_idle() {
             .then(() => console.log('finished'));
     "#,
     );
-    let output = directory.run(&["run", "agent.js"]);
-    assert!(output.status.success());
+    // This is a timer/journal throughput fixture, separate from limit tests.
+    let output = directory.run(&["run", "agent.js", "--cpu-ms", "10000"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(output.stdout, b"starting\nfinished\n");
     assert!(script_stderr(&output).is_empty());
 }

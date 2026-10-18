@@ -4,6 +4,10 @@
 //! stay with the isolate. Every delivered completion gets its own handle scope
 //! and microtask checkpoint before another completion can enter JavaScript.
 
+use super::operations::{
+    validate_json, CancellationGuard, OperationCancellation, OperationSpec, RecoveryPolicy,
+    MAX_OPERATION_RESULT_BYTES,
+};
 use crate::{host::HostState, integrations::networking};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -50,8 +54,11 @@ impl Operations {
         session: Option<&mut super::durability::Session>,
     ) -> Result<(), String> {
         let id = self.id();
+        let args = serde_json::json!([url]);
         if let Some(session) = session {
-            session.register(id, "fetch.get", &serde_json::json!([url]), "safe")?;
+            session.register(id, "fetch.get", &args, RecoveryPolicy::RetrySafe)?;
+        } else {
+            OperationSpec::new("fetch.get", RecoveryPolicy::RetrySafe).validate(&args)?;
         }
         self.fetches.insert(id, resolver);
         self.queued.push((id, url));
@@ -71,7 +78,7 @@ impl Operations {
                 id,
                 "timer.sleep",
                 &serde_json::json!([delay.as_millis() as u64]),
-                "safe",
+                RecoveryPolicy::RetrySafe,
             )?;
         }
         let deadline = Instant::now() + delay;
@@ -172,6 +179,8 @@ pub(crate) fn run(
     evaluation: Option<&v8::Global<v8::Promise>>,
 ) -> Result<(), String> {
     let mut tasks = JoinSet::new();
+    let cancellation = OperationCancellation::default();
+    let _cancellation_guard = CancellationGuard(cancellation.clone());
     loop {
         let mut module_failed = false;
         {
@@ -249,11 +258,26 @@ pub(crate) fn run(
                     .push((id, url));
                 continue;
             }
+            if let Some(session) = scope
+                .get_slot::<HostState>()
+                .expect("host state installed")
+                .session
+                .borrow_mut()
+                .as_mut()
+            {
+                session.begin_dispatch(id)?;
+            }
+            let cancellation = cancellation.clone();
             let _entered = runtime.enter();
             tasks.spawn(async move {
-                let result = tokio::task::spawn_blocking(move || networking::http_get(&url))
-                    .await
-                    .unwrap_or_else(|error| Err(format!("HTTP worker failed: {error}")));
+                let result = tokio::task::spawn_blocking(move || {
+                    cancellation.check()?;
+                    let result = networking::http_get(&url);
+                    cancellation.check()?;
+                    result
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("HTTP worker failed: {error}")));
                 (id, result)
             });
         }
@@ -384,6 +408,24 @@ pub(crate) fn run(
         match completion {
             Completion::PollWaits => unreachable!(),
             Completion::Http((id, result)) => {
+                // Commit a bounded error too: oversized responses must not leave
+                // an ambiguous pending operation or reach JavaScript.
+                let encoded = serde_json::to_value(&result).map_err(|e| e.to_string())?;
+                let cached = scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .session
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|session| session.is_cached(id));
+                let result = if cached {
+                    result
+                } else {
+                    match validate_json(&encoded, MAX_OPERATION_RESULT_BYTES, "result") {
+                        Ok(()) => result,
+                        Err(error) => Err(error),
+                    }
+                };
                 if let Some(session) = scope
                     .get_slot::<HostState>()
                     .expect("host state installed")
