@@ -99,6 +99,8 @@ pub struct HostConfig {
     pub credentials: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "context_limits_default")]
     pub context_limits: crate::ContextLimits,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<crate::integrations::model::ModelConfig>,
 }
 fn context_limits_default(value: &crate::ContextLimits) -> bool {
     *value == crate::ContextLimits::default()
@@ -107,6 +109,16 @@ impl HostConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.grants.validate()?;
         self.context_limits.validate()?;
+        if let Some(model) = &self.model {
+            model.validate()?;
+            if model
+                .credential
+                .as_ref()
+                .is_some_and(|key| !self.credentials.contains_key(key))
+            {
+                return Err("model credential reference is not configured".into());
+            }
+        }
         for reference in self.credentials.values() {
             let mut bytes = reference.bytes();
             if !bytes

@@ -266,6 +266,13 @@ impl Session {
             }
             if recorded.state == "pending"
                 && !RecoveryPolicy::recorded_is_retryable(&recorded.policy)
+                && (recorded.args_json.is_none()
+                    || self
+                        .journal
+                        .attempts(&self.run_id)
+                        .map_err(|e| e.to_string())?
+                        .iter()
+                        .any(|attempt| attempt.seq == seq))
             {
                 return self.diverge(format!(
                     "InterruptedError: operation {seq} cannot be retried"
@@ -387,13 +394,17 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn operation_sequence(&self, id: u32) -> Result<u64, String> {
+        self.pending
+            .get(&id)
+            .copied()
+            .ok_or("operation missing from journal session".into())
+    }
+
     /// Commit a dispatch attempt before contacting an external adapter.
     pub(crate) fn begin_dispatch(&mut self, id: u32) -> Result<OperationIdentity, String> {
         self.flush()?;
-        let sequence = *self
-            .pending
-            .get(&id)
-            .ok_or("operation missing from journal session")?;
+        let sequence = self.operation_sequence(id)?;
         if self.is_cached(id) {
             return Err("cannot dispatch a completed operation".into());
         }

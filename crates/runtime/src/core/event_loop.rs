@@ -16,10 +16,22 @@ use std::{
 use tokio::{runtime::Runtime, task::JoinSet};
 
 pub(crate) type OperationId = u32;
+pub(crate) type JsonTask =
+    Box<dyn FnOnce(OperationCancellation) -> Result<serde_json::Value, String> + Send>;
+/// Owned adapter work: no V8 handles or resolved credentials cross this boundary.
+pub(crate) struct JsonJob {
+    pub name: String,
+    pub args: serde_json::Value,
+    pub network_url: Option<String>,
+    pub required_tool: Option<String>,
+    pub task: JsonTask,
+}
 
 #[derive(Default)]
 pub(crate) struct Operations {
     next_id: OperationId,
+    pub(crate) json_queued: Vec<(OperationId, JsonJob)>,
+    json_resolvers: BTreeMap<OperationId, v8::Global<v8::PromiseResolver>>,
     queued: Vec<(OperationId, String)>,
     fetches: BTreeMap<OperationId, v8::Global<v8::PromiseResolver>>,
     waits: BTreeMap<OperationId, v8::Global<v8::PromiseResolver>>,
@@ -38,13 +50,32 @@ impl Operations {
         // Never reuse a live ID, even after the counter wraps.
         loop {
             self.next_id = self.next_id.wrapping_add(1).max(1);
-            if !self.fetches.contains_key(&self.next_id)
+            if !self.json_resolvers.contains_key(&self.next_id)
+                && !self.fetches.contains_key(&self.next_id)
                 && !self.timers.contains_key(&self.next_id)
                 && !self.waits.contains_key(&self.next_id)
             {
                 return self.next_id;
             }
         }
+    }
+
+    pub(crate) fn json(
+        &mut self,
+        job: JsonJob,
+        recovery: RecoveryPolicy,
+        resolver: v8::Global<v8::PromiseResolver>,
+        session: Option<&mut super::durability::Session>,
+    ) -> Result<(), String> {
+        let id = self.id();
+        if let Some(session) = session {
+            session.register(id, &job.name, &job.args, recovery)?;
+        } else {
+            OperationSpec::new(&job.name, recovery).validate(&job.args)?;
+        }
+        self.json_resolvers.insert(id, resolver);
+        self.json_queued.push((id, job));
+        Ok(())
     }
 
     pub(crate) fn fetch(
@@ -137,13 +168,14 @@ impl Operations {
 type HttpResult = (OperationId, Result<(u16, String), String>);
 enum Completion {
     Http(HttpResult),
+    Json((OperationId, Result<serde_json::Value, String>)),
     Timer(OperationId),
     Wait((OperationId, serde_json::Value)),
     PollWaits,
 }
 
 async fn next_completion(
-    tasks: &mut JoinSet<HttpResult>,
+    tasks: &mut JoinSet<Completion>,
     timer: Option<(OperationId, Instant)>,
     wake: Option<Duration>,
 ) -> Completion {
@@ -165,7 +197,7 @@ async fn next_completion(
     tokio::select! {
         result = tasks.join_next(), if !tasks.is_empty() => {
             // The wrapper task only awaits a worker and constructs owned data.
-            Completion::Http(result.expect("active HTTP task").expect("HTTP wrapper task"))
+            result.expect("active adapter task").expect("adapter wrapper task")
         }
         id = timer_ready => Completion::Timer(id),
         () = wait_ready => Completion::PollWaits,
@@ -283,7 +315,48 @@ pub(crate) fn run(
                 })
                 .await
                 .unwrap_or_else(|error| Err(format!("HTTP worker failed: {error}")));
-                (id, result)
+                Completion::Http((id, result))
+            });
+        }
+        let json_queued = {
+            let state = scope.get_slot::<HostState>().expect("host state installed");
+            std::mem::take(&mut state.operations.borrow_mut().json_queued)
+        };
+        for (id, job) in json_queued {
+            let state = scope.get_slot::<HostState>().expect("host state installed");
+            let cached = state
+                .session
+                .borrow()
+                .as_ref()
+                .is_some_and(|s| s.is_cached(id));
+            if cached {
+                continue;
+            }
+            if historical {
+                state.operations.borrow_mut().json_queued.push((id, job));
+                continue;
+            }
+            if let Some(url) = &job.network_url {
+                state.require_network(url)?;
+            }
+            if let Some(tool) = &job.required_tool {
+                state.require_tool(tool)?;
+            }
+            if let Some(session) = state.session.borrow_mut().as_mut() {
+                session.begin_dispatch(id)?;
+            }
+            let cancellation = cancellation.clone();
+            let _entered = runtime.enter();
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    cancellation.check()?;
+                    let result = (job.task)(cancellation.clone());
+                    cancellation.check()?;
+                    result
+                })
+                .await
+                .unwrap_or_else(|_| Err("adapter worker failed".into()));
+                Completion::Json((id, result))
             });
         }
         let cached = if let Some(session) = scope
@@ -307,6 +380,18 @@ pub(crate) fn run(
                 .contains_key(&id)
             {
                 Some(Completion::Http((
+                    id,
+                    serde_json::from_value(result).map_err(|e| e.to_string())?,
+                )))
+            } else if scope
+                .get_slot::<HostState>()
+                .expect("host state installed")
+                .operations
+                .borrow()
+                .json_resolvers
+                .contains_key(&id)
+            {
+                Some(Completion::Json((
                     id,
                     serde_json::from_value(result).map_err(|e| e.to_string())?,
                 )))
@@ -357,7 +442,7 @@ pub(crate) fn run(
                 session.check_idle()?;
             }
             let ops = state.operations.borrow();
-            if ops.queued.is_empty() && ops.timers.is_empty() {
+            if ops.queued.is_empty() && ops.json_queued.is_empty() && ops.timers.is_empty() {
                 drop(ops);
                 let parked = scope
                     .get_slot::<HostState>()
@@ -454,6 +539,46 @@ pub(crate) fn run(
                 let resolver = v8::Local::new(scope, &retained);
                 networking::complete(scope, resolver, result);
             }
+            Completion::Json((id, result)) => {
+                let cached = scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .session
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|s| s.is_cached(id));
+                let encoded = serde_json::to_value(&result).map_err(|e| e.to_string())?;
+                let result = if cached {
+                    result
+                } else {
+                    match validate_json(&encoded, MAX_OPERATION_RESULT_BYTES, "result") {
+                        Ok(()) => result,
+                        Err(error) => Err(error),
+                    }
+                };
+                if let Some(session) = scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .session
+                    .borrow_mut()
+                    .as_mut()
+                {
+                    session.complete(
+                        id,
+                        &serde_json::to_value(&result).map_err(|e| e.to_string())?,
+                    )?;
+                }
+                let retained = scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .operations
+                    .borrow_mut()
+                    .json_resolvers
+                    .remove(&id)
+                    .ok_or("pending JSON operation missing")?;
+                let resolver = v8::Local::new(scope, &retained);
+                complete_json(scope, resolver, result)?;
+            }
             Completion::Wait((id, result)) => {
                 if let Some(session) = scope
                     .get_slot::<HostState>()
@@ -528,4 +653,25 @@ pub(crate) fn run(
         }
     }
     failure.map_or(Ok(()), Err)
+}
+
+fn complete_json(
+    scope: &mut v8::PinScope<'_, '_>,
+    resolver: v8::Local<v8::PromiseResolver>,
+    result: Result<serde_json::Value, String>,
+) -> Result<(), String> {
+    match result {
+        Ok(value) => {
+            let text =
+                v8::String::new(scope, &value.to_string()).ok_or("JSON result exceeds V8 limit")?;
+            let value = v8::json::parse(scope, text).ok_or("invalid JSON result")?;
+            resolver.resolve(scope, value);
+        }
+        Err(error) => {
+            let message = v8::String::new(scope, &error).ok_or("JSON error exceeds V8 limit")?;
+            let error = v8::Exception::error(scope, message);
+            resolver.reject(scope, error);
+        }
+    }
+    Ok(())
 }

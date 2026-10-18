@@ -41,6 +41,13 @@ impl HostState {
             None => Err("permission denied: net".into()),
         }
     }
+    pub(crate) fn require_tool(&self, tool: &str) -> Result<(), String> {
+        self.effective_capabilities
+            .borrow()
+            .as_ref()
+            .ok_or("permission denied: tool")?
+            .require_tool(tool)
+    }
     #[allow(dead_code)] // Consumed by the memory layer after stacking.
     pub(crate) fn require_memory_scope(&self, scope: &str) -> Result<(), String> {
         self.effective_capabilities
