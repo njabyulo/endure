@@ -111,6 +111,7 @@ impl Fixture {
             model: Some(ModelConfig {
                 endpoint: self.endpoint.clone(),
                 model: "fixture-model".into(),
+                timeout_seconds: 30,
                 credential: None,
                 max_output_tokens: 64,
                 retry_interrupted: false,
@@ -329,13 +330,18 @@ fn operator_model_config_rejects_unsafe_endpoints_and_invalid_limits() {
         let config = ModelConfig {
             endpoint: endpoint.into(),
             model: "x".into(),
+            timeout_seconds: 30,
             credential: None,
             max_output_tokens: 1,
             retry_interrupted: false,
         };
         assert!(config.validate().is_err());
     }
-    assert!(HostConfig::from_yaml("model: {endpoint: 'https://example.com/v1/chat/completions', model: fixture, credential: missing, max_output_tokens: 8}").is_err());
+    let error = HostConfig::from_yaml("model: {endpoint: 'https://example.com/v1/chat/completions', model: fixture, credential: missing, max_output_tokens: 8}").unwrap_err();
+    assert!(
+        error.contains("model credential reference is not configured"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -402,15 +408,26 @@ fn killed_model_request_does_not_automatically_dispatch_again() {
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "model_process_worker", "--nocapture"])
         .env("ONDURE_MODEL_TEST_PROJECT", &p.0)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    for _ in 0..200 {
-        if fixture.hits.load(Ordering::SeqCst) == 1 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while fixture.hits.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
             break;
         }
         thread::sleep(Duration::from_millis(5));
+    }
+    if fixture.hits.load(Ordering::SeqCst) != 1 {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "model worker did not dispatch: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     assert_eq!(fixture.hits.load(Ordering::SeqCst), 1);
     child.kill().unwrap();
@@ -485,4 +502,87 @@ fn normalized_result_envelope_limit_applies_when_provider_body_fits() {
     }));
     assert!(serde_json::to_vec(&normalized).unwrap().len() > runtime::MAX_OPERATION_RESULT_BYTES);
     assert_oversized_model_response_is_committed(body, "host operation result exceed");
+}
+
+#[test]
+fn credentialed_model_endpoints_require_tls_except_literal_loopback() {
+    let fixture = Fixture::success();
+    let mut config = fixture.config().model.unwrap();
+    config.credential = Some("provider".into());
+    for endpoint in [
+        "https://api.example.com/v1/chat/completions",
+        "http://localhost:1234/v1/chat/completions",
+        "http://127.0.0.2:1234/v1/chat/completions",
+        "http://[::1]:1234/v1/chat/completions",
+    ] {
+        config.endpoint = endpoint.into();
+        assert!(config.validate().is_ok(), "{endpoint}");
+    }
+    for endpoint in [
+        "http://api.example.com/v1/chat/completions",
+        "http://127.0.0.1.evil.example/v1/chat/completions",
+        "http://192.168.1.2/v1/chat/completions",
+        "http://0.0.0.0/v1/chat/completions",
+    ] {
+        config.endpoint = endpoint.into();
+        assert!(
+            config.validate().unwrap_err().contains("must use HTTPS"),
+            "{endpoint}"
+        );
+    }
+    config.credential = None;
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn configured_model_timeout_is_bounded_and_default_serialization_is_compatible() {
+    let fixture = Fixture::success();
+    let config = fixture.config();
+    let encoded = serde_json::to_value(&config).unwrap();
+    assert!(encoded["model"].get("timeout_seconds").is_none());
+    let mut explicit_default = encoded.clone();
+    explicit_default["model"]["timeout_seconds"] = json!(30);
+    let decoded: HostConfig = serde_json::from_value(explicit_default).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+    let mut model = config.model.unwrap();
+    for timeout in [0, 3601, u64::MAX] {
+        model.timeout_seconds = timeout;
+        assert!(model.validate().is_err());
+    }
+    for timeout in [1, 3600] {
+        model.timeout_seconds = timeout;
+        assert!(model.validate().is_ok());
+    }
+}
+
+#[test]
+fn configured_model_timeout_commits_unknown_outcome_and_replays_without_dispatch() {
+    let fixture = Fixture::new(0, String::new());
+    let p = Project::new(&fixture.origin(), "ctx.model.call('Hello')");
+    let mut config = fixture.config();
+    config.model.as_mut().unwrap().timeout_seconds = 1;
+    let error = run_request_with_config(
+        &config,
+        &p.graph(),
+        &p.journal(),
+        "timeout",
+        "null",
+        RunLimits::default(),
+    )
+    .unwrap_err();
+    assert!(error.message.contains("outcome may be unknown"), "{error}");
+    let journal = Journal::open(&p.journal()).unwrap();
+    let run = journal.find_request("timeout").unwrap().unwrap();
+    let op = &journal.operations(&run.id).unwrap()[0];
+    assert_eq!(op.state, "completed");
+    assert!(op
+        .result
+        .as_ref()
+        .unwrap()
+        .contains("outcome may be unknown"));
+    assert_eq!(
+        replay_run(&p.journal(), &run.id, None).unwrap_err().message,
+        error.message
+    );
+    assert_eq!(fixture.hits.load(Ordering::SeqCst), 1);
 }

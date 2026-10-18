@@ -14,12 +14,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, io::Read, time::Duration};
 
+const DEFAULT_MODEL_TIMEOUT_SECONDS: u64 = 30;
+fn default_timeout_seconds() -> u64 {
+    DEFAULT_MODEL_TIMEOUT_SECONDS
+}
+fn default_timeout(value: &u64) -> bool {
+    *value == DEFAULT_MODEL_TIMEOUT_SECONDS
+}
+
+/// Trusted endpoint, credential reference, output ceiling and request timeout.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// Full HTTP(S) Chat Completions URL. Automatic redirects are disabled.
     pub endpoint: String,
     pub model: String,
+    /// Total adapter request timeout; default 30 seconds, configurable up to one hour.
+    #[serde(
+        default = "default_timeout_seconds",
+        skip_serializing_if = "default_timeout"
+    )]
+    pub timeout_seconds: u64,
     /// Logical key into HostConfig.credentials, whose value names an env variable.
     #[serde(default)]
     pub credential: Option<String>,
@@ -29,6 +44,7 @@ pub struct ModelConfig {
     pub retry_interrupted: bool,
 }
 impl ModelConfig {
+    /// Enforce endpoint transport, reference syntax and finite request bounds.
     pub fn validate(&self) -> Result<(), String> {
         let url = url::Url::parse(&self.endpoint).map_err(|_| "invalid model endpoint")?;
         if !matches!(url.scheme(), "http" | "https")
@@ -42,6 +58,18 @@ impl ModelConfig {
                 "model endpoint must be an HTTP(S) URL without credentials, query or fragment"
                     .into(),
             );
+        }
+        let loopback = match url.host() {
+            Some(url::Host::Domain(host)) => host == "localhost",
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        };
+        if self.credential.is_some() && url.scheme() != "https" && !loopback {
+            return Err("credentialed model endpoints must use HTTPS except literal localhost or loopback IPs".into());
+        }
+        if !(1..=3600).contains(&self.timeout_seconds) {
+            return Err("model timeout_seconds must be between 1 and 3600".into());
         }
         if self.model.trim().is_empty()
             || self.model.len() > 256
@@ -230,7 +258,7 @@ fn execute(
     let client = ureq::AgentBuilder::new().redirects(0).build();
     let mut call = client
         .post(&config.endpoint)
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(config.timeout_seconds))
         .set("Content-Type", "application/json")
         .set("Accept", "application/json");
     if let Some(reference) = &config.credential {

@@ -43,6 +43,7 @@ model:
   model: your-model
   credential: provider
   max_output_tokens: 128
+  timeout_seconds: 120 # optional; default 30, allowed 1..3600
   retry_interrupted: false
 ```
 
@@ -50,7 +51,12 @@ Set `ONDURE_PROVIDER_KEY` in the host environment and change the agent's
 requested origin to the same exact origin. Keep credentials out of source and
 configuration values. Logical credential references resolve inside the host
 worker just before dispatch. Credential values and provider error bodies are
-not written to operation records. Automatic redirects are disabled.
+not written to operation records. Automatic redirects are disabled. Credentialed
+endpoints require HTTPS; plaintext HTTP is allowed only for literal `localhost`
+or loopback IP addresses used by local fixtures. An uncredentialed endpoint may
+use HTTP. The total request timeout is trusted configuration (`timeout_seconds`,
+default 30, range 1–3600). A timeout records an unknown-outcome error; it does not
+prove that the provider stopped processing or avoided charging the request.
 
 Completed outcomes commit before JavaScript receives them and replay without
 contacting the provider. The default recovery policy refuses to reissue an
