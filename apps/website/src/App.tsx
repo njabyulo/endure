@@ -9,7 +9,7 @@ import "./App.css";
 
 const GITHUB = "https://github.com/njabyulo/endure";
 const INSTALL =
-  "git clone --branch feat/agent-runtime-website https://github.com/njabyulo/endure.git\ncd endure\ncargo build --release --bin ondure\npython3 examples/model-operations/run.py";
+  "git clone --branch feat/agent-runtime-website https://github.com/njabyulo/endure.git\ncd endure\ncargo build --bin ondure\npython3 examples/model-operations/run.py";
 
 function Header() {
   const [open, setOpen] = useState(false);

@@ -33,7 +33,7 @@ describe("landing page controls", () => {
       expect(screen.getByText("Commands copied.")).toBeInTheDocument(),
     );
     expect(writeText).toHaveBeenCalledWith(
-      expect.stringContaining("cargo build --release --bin ondure"),
+      expect.stringContaining("cargo build --bin ondure"),
     );
     expect(writeText).toHaveBeenCalledWith(
       expect.stringContaining("python3 examples/model-operations/run.py"),
