@@ -5,16 +5,19 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct Project(PathBuf);
 impl Project {
     fn new(source: &str) -> Self {
         let root = std::env::temp_dir().join(format!(
-            "ondure-parking-cli-{}-{}",
+            "ondure-parking-cli-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&root).unwrap();
         fs::write(root.join("agent.ts"), source).unwrap();

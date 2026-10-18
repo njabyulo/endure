@@ -9,6 +9,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      RUST_TEST_THREADS: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
