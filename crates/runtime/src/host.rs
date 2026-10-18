@@ -440,7 +440,22 @@ fn run_request_configuration(
         if run.status == "diverged" {
             return Err(fail("request run has diverged".into()));
         }
-        replay_run_with_limits(path, &run.id, Some(graph), limits)?;
+        if child_depth > 0 {
+            // A scheduler may already own this child's run lease without its
+            // request lease. Rejoin that live identity through the parent's
+            // durable child wait rather than committing a transient lease error.
+            let Some(lease) =
+                crate::core::parking::RunLease::try_acquire(path, &format!("run:{}", run.id))
+                    .map_err(fail)?
+            else {
+                return Ok(run);
+            };
+            let (recorded, policy, session) =
+                Session::resume_with_lease(path, &run.id, lease).map_err(fail)?;
+            replay_session(recorded, policy, session, Some(graph), limits)?;
+        } else {
+            replay_run_with_limits(path, &run.id, Some(graph), limits)?;
+        }
         return journal.get_run(&run.id).map_err(|e| fail(e.to_string()));
     }
     let id = crate::new_run_id();

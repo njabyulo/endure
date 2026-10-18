@@ -109,7 +109,8 @@ impl Session {
             Some(children) => children,
             None => crate::integrations::children::capture(graph, host_config)?,
         };
-        let mut snapshot = serde_json::json!({"graph": graph, "net": policy.net, "input": input, "agent_returns": true, "children":children,"child_depth":child_depth});
+        let capture_agent_return = child_depth > 0;
+        let mut snapshot = serde_json::json!({"graph": graph, "net": policy.net, "input": input, "agent_returns": capture_agent_return, "children":children,"child_depth":child_depth});
         if let Some(config) = host_config {
             snapshot["host_config"] = serde_json::to_value(config).map_err(|e| e.to_string())?;
         }
@@ -160,7 +161,7 @@ impl Session {
             last_flush: Instant::now(),
             input,
             host_config: host_config.cloned(),
-            capture_agent_return: true,
+            capture_agent_return,
             child_depth,
             children,
             waits: BTreeMap::new(),

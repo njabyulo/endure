@@ -14,7 +14,9 @@ can only request capabilities shared by the parent's effective authority and
 its configured delegation. Agent code cannot increase these grants.
 
 `ctx.agents.run(name, input)` resolves to the child handler's JSON return
-value (`undefined` becomes `null`). Returns are bounded JSON; arbitrary V8
+value (`undefined` becomes `null`). New top-level runs ignore handler return
+values; child return values are persisted for their waiting parent. Previously
+recorded return-capture markers remain honored during replay. Returns are bounded JSON; arbitrary V8
 objects, closures, and JavaScript promises are not persisted. The runtime
 captures local child modules before the parent's first execution. Module
 paths must remain under the parent's entry directory. Captured modules are
@@ -30,7 +32,9 @@ If a child sleeps or awaits approval, the parent also parks without retaining
 an isolate or worker. Inspect the child run's wait and answer it with the
 trusted local approval command, then run `wake` to continue the parent. A
 wake batch may need another invocation when it wakes a child after examining
-its parent. A failed child rejects the parent's await.
+its parent. A failed child rejects the parent's await. If another scheduler already owns a
+live child, the parent parks on that same child instead of treating lease
+contention as a permanent failure.
 
 Child allocations reserve parent resources before launch. Children receive
 finite token and dollar limits and the parent's absolute elapsed deadline.

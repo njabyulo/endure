@@ -203,11 +203,15 @@ fn missing_child_grants_and_module_escape_are_denied() {
         RunLimits::default()
     )
     .is_err());
-    assert!(Journal::open(&p.journal())
+    let children: i64 = rusqlite::Connection::open(p.journal())
         .unwrap()
-        .find_request("child:missing:0")
-        .unwrap()
-        .is_none());
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE request_id LIKE 'child:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(children, 0, "denied launch must not persist any child run");
     let mut config = p.config();
     config.agents.get_mut("worker").unwrap().module = "../outside.js".into();
     assert!(run_request_with_config(
@@ -457,4 +461,136 @@ fn killed_parent_rejoins_completed_child_without_repeating_effect() {
     );
     assert_eq!(p.child(&parent_id).id, child_id);
     assert_eq!(witness.finish(), 1);
+}
+
+#[test]
+fn top_level_returns_are_not_serialized_but_recorded_return_markers_still_replay() {
+    for expression in [
+        "(()=>{const value={};value.self=value;return value})()",
+        "'x'.repeat(2*1024*1024)",
+    ] {
+        let p=Project::new(&format!("import {{agent}} from 'ondure';export default agent('top',()=>{{console.log('ok');return {expression}}});"),"import {agent} from 'ondure';export default agent('unused',()=>null)");
+        let run = p.run(&HostConfig::default());
+        assert_eq!(run.stdout, "ok\n");
+        assert!(!Journal::open(&p.journal())
+            .unwrap()
+            .operations(&run.id)
+            .unwrap()
+            .iter()
+            .any(|operation| operation.name == "agent.return"));
+        assert_eq!(
+            replay_run(&p.journal(), &run.id, None).unwrap().stdout,
+            "ok\n"
+        );
+    }
+    // Earlier c18 top-level runs captured JSON returns. Preserve their marker
+    // and operation identity when replaying an already committed journal.
+    let p = Project::new(
+        "import {agent} from 'ondure';export default agent('old',()=>7)",
+        "import {agent} from 'ondure';export default agent('unused',()=>null)",
+    );
+    let run = p.run(&HostConfig::default());
+    let mut snapshot: Value = serde_json::from_str(&run.graph).unwrap();
+    snapshot["agent_returns"] = json!(true);
+    let args = json!({"value":7});
+    use sha2::{Digest, Sha256};
+    let mut journal = Journal::open(&p.journal()).unwrap();
+    journal
+        .intents(
+            &run.id,
+            &[runtime::OpIntent {
+                seq: 0,
+                name: "agent.return".into(),
+                args_digest: format!("{:x}", Sha256::digest(args.to_string().as_bytes())),
+                args_json: Some(args.to_string()),
+                policy: "safe".into(),
+            }],
+        )
+        .unwrap();
+    journal.complete(&run.id, 0, r#"{"Ok":7}"#).unwrap();
+    let connection = rusqlite::Connection::open(p.journal()).unwrap();
+    connection
+        .execute(
+            "UPDATE runs SET graph=?2 WHERE id=?1",
+            rusqlite::params![run.id, snapshot.to_string()],
+        )
+        .unwrap();
+    assert!(replay_run(&p.journal(), &run.id, None).is_ok());
+}
+
+#[test]
+fn parent_rejoins_a_child_owned_by_another_scheduler_without_recording_lease_failure() {
+    use sha2::{Digest, Sha256};
+    let p=Project::new(PARENT,"import {agent} from 'ondure';export default agent('child',async ctx=>{await ctx.human.approve({action:'review'});return 'finished'})");
+    let run = p.run(&p.config());
+    let child = p.child(&run.id);
+    let journal = Journal::open(&p.journal()).unwrap();
+    let launch = journal
+        .operations(&run.id)
+        .unwrap()
+        .into_iter()
+        .find(|operation| operation.name == "agent.run")
+        .unwrap();
+    let approval = journal.waits(&child.id).unwrap()[0].seq;
+    let connection = rusqlite::Connection::open(p.journal()).unwrap();
+    connection
+        .execute(
+            "DELETE FROM waits WHERE run_id=?1 AND seq>?2",
+            rusqlite::params![run.id, launch.seq],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM operations WHERE run_id=?1 AND seq>?2",
+            rusqlite::params![run.id, launch.seq],
+        )
+        .unwrap();
+    connection.execute("UPDATE operations SET state='pending',result=NULL,completion_order=NULL WHERE run_id=?1 AND seq=?2",rusqlite::params![run.id,launch.seq]).unwrap();
+    connection
+        .execute(
+            "UPDATE resource_reservations SET state='active' WHERE run_id=?1 AND seq=?2",
+            rusqlite::params![run.id, launch.seq],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE runs SET status='running' WHERE id IN (?1,?2)",
+            rusqlite::params![run.id, child.id],
+        )
+        .unwrap();
+    let lease_dir = std::path::PathBuf::from(format!(
+        "{}.leases",
+        p.journal().canonicalize().unwrap().display()
+    ));
+    let lease_file = lease_dir.join(format!(
+        "{:x}",
+        Sha256::digest(format!("run:{}", child.id).as_bytes())
+    ));
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lease_file)
+        .unwrap();
+    lease.try_lock().unwrap();
+    replay_run(&p.journal(), &run.id, None).unwrap();
+    assert_eq!(journal.get_run(&run.id).unwrap().status, "parked");
+    let result = journal
+        .operations(&run.id)
+        .unwrap()
+        .into_iter()
+        .find(|operation| operation.name == "agent.run")
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&result).unwrap()["Ok"]["child_run_id"],
+        child.id
+    );
+    assert!(!result.contains("already running"));
+    drop(lease);
+    approve_run(&p.journal(), &child.id, approval, true).unwrap();
+    assert_eq!(
+        replay_run(&p.journal(), &run.id, None).unwrap().stdout,
+        "\"finished\"\n"
+    );
 }

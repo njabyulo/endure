@@ -12,12 +12,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path};
 
+/// Finite parent reservations assigned to one durable child request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChildAllocation {
     pub tokens: u64,
     pub dollar_micros: u64,
 }
+/// Trusted local module, delegated authority, and per-child resources.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChildConfig {
@@ -27,6 +29,7 @@ pub struct ChildConfig {
     pub allocation: ChildAllocation,
 }
 impl ChildConfig {
+    /// Reject nonlocal paths, invalid delegation, and unsupported allocations.
     pub fn validate(&self) -> Result<(), String> {
         if self.module.is_empty() || Path::new(&self.module).is_absolute() {
             return Err("child module must be a relative local path".into());
