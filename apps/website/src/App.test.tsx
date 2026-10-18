@@ -14,7 +14,9 @@ describe("landing page controls", () => {
     const toggle = screen.getByRole("button", { name: "Open menu" });
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
-    fireEvent.keyDown(toggle, { key: "Escape" });
+    const firstLink = screen.getByRole("link", { name: "Runtime" });
+    expect(firstLink).toHaveFocus();
+    fireEvent.keyDown(firstLink, { key: "Escape" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(toggle).toHaveFocus();
     fireEvent.click(toggle);

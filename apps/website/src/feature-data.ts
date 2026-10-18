@@ -40,13 +40,16 @@ await ctx.state.compareAndSet("visits", current?.version ?? 0,
   },
   {
     title: "Budgets and scheduling",
-    detail: "Reserve token and spend estimates before dispatch. Queue work behind concurrency and rate limits. Elapsed deadlines include parked time; usage and configured prices guide reconciliation.",
+    detail: "Reserve token and spend estimates before dispatch. Queue work behind concurrency and rate limits. Elapsed deadlines include parked time; usage and configured prices guide reconciliation. The sample rates below are illustrative; replace them with your configured provider prices and tool estimates.",
     path: "examples/resource-budgets/README.md",
     language: "OPERATOR YAML",
     syntax: "yaml",
     code: `resources:
   token_limit: 10000
   dollar_limit_micros: 2000000 # USD 2
+  input_price_micros_per_million_tokens: 1000000 # USD 1 / million
+  output_price_micros_per_million_tokens: 2000000 # USD 2 / million
+  tool_estimate_micros: 100 # USD 0.0001 / call
   model_concurrency: 2
   tool_concurrency: 4
   model_rate: { max_calls: 10, window_ms: 60000 }

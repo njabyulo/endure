@@ -14,6 +14,10 @@ const GITHUB = "https://github.com/njabyulo/endure";
 function Header() {
   const [open, setOpen] = useState(false);
   const toggle = useRef<HTMLButtonElement>(null);
+  const firstNavigationLink = useRef<HTMLAnchorElement>(null);
+  useEffect(() => {
+    if (open) firstNavigationLink.current?.focus();
+  }, [open]);
   return (
     <header
       className="header"
@@ -33,7 +37,7 @@ function Header() {
         id="navigation"
         aria-label="Main navigation"
       >
-        <a href="#runtime" onClick={() => setOpen(false)}>
+        <a ref={firstNavigationLink} href="#runtime" onClick={() => setOpen(false)}>
           Runtime
         </a>
         <a href="#features" onClick={() => setOpen(false)}>Features</a>
