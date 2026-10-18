@@ -33,4 +33,5 @@ pub use core::operations::{
 
 pub use capabilities::config::{Capabilities, HostConfig};
 
+pub use core::durability::approve_run_with_note_and_limits;
 pub use host::{run_durable_with_config, run_request_with_config};

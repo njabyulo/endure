@@ -1,7 +1,7 @@
 mod supervisor;
 
 use runtime::{
-    approve_run_with_limits, journal_log, new_run_id, replay_run_with_limits,
+    approve_run_with_note_and_limits, journal_log, new_run_id, replay_run_with_limits,
     run_durable_with_config, run_durable_with_limits, run_request_with_config,
     run_request_with_limits, wake_ready_with_limits, HostConfig, HostError, Journal, ModuleGraph,
     Policy, RunLimits, RunOutput,
@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
 };
-const USAGE: &str = "usage: ondure run <script> [--run-id <id> | --request <id>] [--input <json>] [--journal <path>] [--cpu-ms <ms>] [--heap-mb <MiB>] | replay <run-id> | log <run-id> | approve <run-id> <wait-seq> yes|no | wake";
+const USAGE: &str = "usage: ondure run <script> [--run-id <id> | --request <id>] [--input <json>] [--journal <path>] [--cpu-ms <ms>] [--heap-mb <MiB>] | replay <run-id> | log <run-id> | approve <run-id> <wait-seq> yes|no [--note <text>] | wake";
 
 fn run(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<(), Box<dyn Error>> {
     let command = arguments
@@ -49,9 +49,11 @@ fn run(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<(), Bo
     let mut run_id = None;
     let mut request = None;
     let mut input = "null".to_string();
+    let mut note = None;
     while let Some(flag) = arguments.next() {
         let value = arguments.next().ok_or("missing option value")?;
         match flag.to_str() {
+            Some("--note") => note = Some(value.into_string().map_err(|_| "note must be UTF-8")?),
             Some("--journal") => journal = value.into(),
             Some("--cpu-ms") => {
                 limits.cpu_ms = value.to_str().ok_or("invalid CPU budget")?.parse()?
@@ -94,11 +96,12 @@ fn run(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<(), Bo
         }
         "approve" => {
             let (seq, answer) = answer.ok_or(USAGE)?;
-            emit(approve_run_with_limits(
+            emit(approve_run_with_note_and_limits(
                 &journal,
                 id.ok_or(USAGE)?,
                 seq,
                 answer,
+                note.as_deref(),
                 limits,
             ))?;
             report_parked(&journal, id.unwrap())?;

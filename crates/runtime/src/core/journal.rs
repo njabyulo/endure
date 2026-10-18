@@ -445,6 +445,30 @@ impl Journal {
         Ok(changed)
     }
 
+    /// Atomically commit a timeout only if no operator answer has committed.
+    pub(crate) fn timeout_wait(
+        &mut self,
+        run_id: &str,
+        seq: u64,
+        answer: &str,
+        now: i64,
+    ) -> Result<String, JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seq = sequence(seq)?;
+        transaction.execute("UPDATE waits SET answer = ?3 WHERE run_id = ?1 AND seq = ?2 AND answer IS NULL AND wake_at <= ?4", params![run_id, seq, answer, now])?;
+        let winner = transaction
+            .query_row(
+                "SELECT answer FROM waits WHERE run_id = ?1 AND seq = ?2",
+                params![run_id, seq],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .ok_or_else(|| JournalError("approval deadline not ready".into()))?;
+        transaction.commit()?;
+        Ok(winner)
+    }
+
     pub fn operations(&self, run_id: &str) -> Result<Vec<OpRecord>, JournalError> {
         let mut statement = self.connection.prepare(
             "SELECT seq, name, args_digest, policy, state, result, completion_order, args_json
@@ -614,6 +638,40 @@ mod tests {
         journal
             .create_run("run", Some("request"), "hash", "input", "graph")
             .unwrap();
+    }
+
+    #[test]
+    fn operator_and_timeout_race_preserves_first_committed_answer() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..8 {
+            let path = temporary_path();
+            let mut journal = Journal::open(&path).unwrap();
+            create(&mut journal);
+            journal.intents("run", &[intent(0)]).unwrap();
+            journal
+                .park_wait("run", 0, "approval", Some(0), "{}")
+                .unwrap();
+            drop(journal);
+            let barrier = Arc::new(Barrier::new(2));
+            let other_path = path.clone();
+            let other_barrier = barrier.clone();
+            let operator = std::thread::spawn(move || {
+                let mut journal = Journal::open(&other_path).unwrap();
+                other_barrier.wait();
+                journal.answer_wait("run", 0, "operator")
+            });
+            let mut journal = Journal::open(&path).unwrap();
+            barrier.wait();
+            let winner = journal.timeout_wait("run", 0, "timeout", 0).unwrap();
+            let operator_won = operator.join().unwrap().is_ok();
+            assert_eq!(winner, if operator_won { "operator" } else { "timeout" });
+            assert_eq!(
+                journal.waits("run").unwrap()[0].answer.as_deref(),
+                Some(winner.as_str())
+            );
+            drop(journal);
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
