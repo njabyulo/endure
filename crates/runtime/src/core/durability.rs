@@ -35,6 +35,9 @@ pub(crate) struct Session {
     last_flush: Instant,
     pub(crate) input: Value,
     pub(crate) host_config: Option<HostConfig>,
+    pub(crate) capture_agent_return: bool,
+    pub(crate) child_depth: usize,
+    pub(crate) children: BTreeMap<String, ModuleGraph>,
     waits: BTreeMap<u32, WaitRecord>,
     resource_deadline: Option<i64>,
 }
@@ -69,6 +72,31 @@ impl Session {
         input: Value,
         host_config: Option<&HostConfig>,
     ) -> Result<Self, String> {
+        Self::create_captured_request(
+            path,
+            id,
+            policy,
+            graph,
+            request_id,
+            input,
+            host_config,
+            None,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_captured_request(
+        path: &Path,
+        id: &str,
+        policy: &Policy,
+        graph: &ModuleGraph,
+        request_id: Option<&str>,
+        input: Value,
+        host_config: Option<&HostConfig>,
+        captured_children: Option<BTreeMap<String, ModuleGraph>>,
+        child_depth: usize,
+    ) -> Result<Self, String> {
         if let Some(config) = host_config {
             config.validate()?;
         }
@@ -77,7 +105,12 @@ impl Session {
         }
         let lease = RunLease::acquire(path, &format!("run:{id}"))?;
         let mut journal = Journal::open(path).map_err(|e| e.to_string())?;
-        let mut snapshot = serde_json::json!({"graph": graph, "net": policy.net, "input": input});
+        let children = match captured_children {
+            Some(children) => children,
+            None => crate::integrations::children::capture(graph, host_config)?,
+        };
+        let capture_agent_return = child_depth > 0;
+        let mut snapshot = serde_json::json!({"graph": graph, "net": policy.net, "input": input, "agent_returns": capture_agent_return, "children":children,"child_depth":child_depth});
         if let Some(config) = host_config {
             snapshot["host_config"] = serde_json::to_value(config).map_err(|e| e.to_string())?;
         }
@@ -104,6 +137,15 @@ impl Session {
             epoch_millis()?,
             false,
         )?;
+        if child_depth > 0 {
+            let parent = request_id
+                .and_then(|id| id.strip_prefix("child:"))
+                .and_then(|id| id.split(':').next())
+                .ok_or("child request missing parent identity")?;
+            if let Some(deadline) = journal.resource_deadline(parent)? {
+                journal.attenuate_resource_deadline(id, deadline)?;
+            }
+        }
         let resource_deadline = journal.resource_deadline(id)?;
         Ok(Self {
             _lease: lease,
@@ -119,6 +161,9 @@ impl Session {
             last_flush: Instant::now(),
             input,
             host_config: host_config.cloned(),
+            capture_agent_return,
+            child_depth,
+            children,
             waits: BTreeMap::new(),
             resource_deadline,
         })
@@ -163,6 +208,21 @@ impl Session {
             epoch_millis()?,
             true,
         )?;
+        let child_depth = snapshot
+            .get("child_depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        if child_depth > 0 {
+            let parent = record
+                .request_id
+                .as_deref()
+                .and_then(|id| id.strip_prefix("child:"))
+                .and_then(|id| id.split(':').next())
+                .ok_or("child request missing parent identity")?;
+            if let Some(deadline) = journal.resource_deadline(parent)? {
+                journal.attenuate_resource_deadline(id, deadline)?;
+            }
+        }
         let resource_deadline = journal.resource_deadline(id)?;
         let operations = journal.operations(id).map_err(|e| e.to_string())?;
         for (index, op) in operations.iter().enumerate() {
@@ -185,6 +245,21 @@ impl Session {
             last_flush: Instant::now(),
             input: snapshot.get("input").cloned().unwrap_or(Value::Null),
             host_config,
+            child_depth: snapshot
+                .get("child_depth")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize,
+            capture_agent_return: snapshot
+                .get("agent_returns")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            children: serde_json::from_value(
+                snapshot
+                    .get("children")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
+            .map_err(|e| e.to_string())?,
             waits: BTreeMap::new(),
             resource_deadline,
         };
@@ -337,10 +412,10 @@ impl Session {
     ) -> Result<(), String> {
         self.register(
             id,
-            if kind == "approval" {
-                "wait.approval"
-            } else {
-                "wait.timer"
+            match kind {
+                "approval" => "wait.approval",
+                "child" => "wait.child",
+                _ => "wait.timer",
             },
             args,
             RecoveryPolicy::RetrySafe,
@@ -366,6 +441,24 @@ impl Session {
                     id,
                     serde_json::json!({"Err":"BudgetError: elapsed deadline exceeded"}),
                 )));
+            }
+        }
+        for (&id, wait) in &self.waits {
+            if wait.kind == "child" {
+                let details: Value =
+                    serde_json::from_str(&wait.details).map_err(|e| e.to_string())?;
+                let child = details
+                    .get("child_run_id")
+                    .and_then(Value::as_str)
+                    .ok_or("child wait missing identity")?;
+                if let Some(outcome) =
+                    crate::integrations::children::completed(&self.journal, child)?
+                {
+                    return Ok(Some((
+                        id,
+                        serde_json::to_value(outcome).map_err(|e| e.to_string())?,
+                    )));
+                }
             }
         }
         let ready = self
@@ -424,6 +517,10 @@ impl Session {
             self.last_flush = Instant::now();
         }
         Ok(())
+    }
+
+    pub(crate) fn next_operation_sequence(&self) -> u64 {
+        self.next_seq
     }
 
     pub(crate) fn operation_sequence(&self, id: u32) -> Result<u64, String> {
@@ -636,6 +733,18 @@ pub(crate) fn can_remain_parked(journal: &Journal, run_id: &str) -> Result<bool,
         .filter(|op| op.state == "pending")
         .collect();
     let waits = journal.waits(run_id).map_err(|e| e.to_string())?;
+    for wait in &waits {
+        if wait.kind == "child" && pending.iter().any(|op| op.seq == wait.seq) {
+            let details: Value = serde_json::from_str(&wait.details).map_err(|e| e.to_string())?;
+            let child = details
+                .get("child_run_id")
+                .and_then(Value::as_str)
+                .ok_or("child wait missing identity")?;
+            if crate::integrations::children::completed(journal, child)?.is_some() {
+                return Ok(false);
+            }
+        }
+    }
     Ok(!pending.is_empty()
         && pending.iter().all(|op| {
             waits

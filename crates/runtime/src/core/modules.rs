@@ -27,14 +27,14 @@ impl std::error::Error for ModuleError {}
 
 /// An immutable snapshot of the reachable execution graph, including emitted JS.
 /// Explicit `import type` declarations are erased before graph traversal.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModuleGraph {
     pub(crate) filename: String,
     entry: String,
     modules: BTreeMap<String, PreparedModule>,
     hash: String,
 }
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PreparedModule {
     source: String,
     javascript: String,

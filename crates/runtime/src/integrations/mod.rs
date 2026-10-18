@@ -8,4 +8,5 @@ pub(crate) mod mcp;
 pub(crate) mod mcp_schema;
 pub(crate) mod model;
 
+pub(crate) mod children;
 pub(crate) mod mcp_native;

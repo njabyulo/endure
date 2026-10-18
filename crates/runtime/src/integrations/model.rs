@@ -212,6 +212,7 @@ fn call(
             args: journal_args,
             network_url: Some(config.endpoint.clone()),
             required_tool: None,
+            required_child: None,
             task: Box::new(move |cancellation| {
                 execute(&config, &credentials, &request, &cancellation)
             }),

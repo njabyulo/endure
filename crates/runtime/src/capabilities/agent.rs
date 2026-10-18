@@ -225,9 +225,28 @@ pub(crate) fn invoke_default(
         let input = v8::json::parse(scope, input).ok_or("agent input JSON")?;
         let handler = v8::Local::new(scope, &definition.0);
         let receiver = v8::undefined(scope);
-        // None leaves V8's original exception pending. Do not replace a
-        // handler's synchronous throw with an unrelated host error.
-        Ok(handler.call(scope, receiver.into(), &[context.into(), input]))
+        // Preserve the original synchronous V8 exception when the call fails.
+        let Some(result) = handler.call(scope, receiver.into(), &[context.into(), input]) else {
+            return Ok(None);
+        };
+        let capture = scope
+            .get_slot::<HostState>()
+            .expect("host state installed")
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.capture_agent_return);
+        if !capture {
+            return Ok(Some(result));
+        }
+        let resolver = v8::PromiseResolver::new(scope).ok_or("agent result promise")?;
+        resolver.resolve(scope, result);
+        let callback = v8::Function::new(scope, capture_return).ok_or("agent return callback")?;
+        let promise = resolver
+            .get_promise(scope)
+            .then(scope, callback)
+            .ok_or("agent return continuation")?;
+        Ok(Some(promise.into()))
     })();
     match result {
         Ok(Some(value)) => output.set(value),
@@ -249,6 +268,7 @@ pub(crate) fn create_context<'s>(
     super::memory::install_context(scope, context)?;
     crate::integrations::model::install_context(scope, context)?;
     crate::integrations::mcp_native::install_context(scope, context)?;
+    crate::integrations::children::install_context(scope, context)?;
     Ok(context)
 }
 
@@ -365,4 +385,38 @@ fn approve_agent(
 
 pub(crate) fn dispose(isolate: &mut v8::Isolate) {
     isolate.remove_slot::<Agents>();
+}
+
+fn capture_return(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut output: v8::ReturnValue,
+) {
+    let result = (|| -> Result<serde_json::Value, String> {
+        let value = if args.get(0).is_undefined() {
+            serde_json::Value::Null
+        } else {
+            let text = v8::json::stringify(scope, args.get(0))
+                .ok_or("agent result must be JSON serializable")?;
+            serde_json::from_str(&text.to_rust_string_lossy(scope))
+                .map_err(|_| "invalid agent result")?
+        };
+        let state = scope.get_slot::<HostState>().expect("host state installed");
+        let mut session = state.session.borrow_mut();
+        session.as_mut().ok_or("durable session required")?.sync_op(
+            "agent.return",
+            &serde_json::json!({"value":value}),
+            || Ok(value.clone()),
+        )
+    })();
+    match result {
+        Ok(value) => {
+            if let Some(text) = v8::String::new(scope, &value.to_string()) {
+                if let Some(value) = v8::json::parse(scope, text) {
+                    output.set(value);
+                }
+            }
+        }
+        Err(error) => throw(scope, &error),
+    }
 }

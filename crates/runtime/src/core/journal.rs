@@ -80,6 +80,12 @@ pub struct Journal {
 }
 
 impl Journal {
+    pub(crate) fn path(&self) -> Result<std::path::PathBuf, JournalError> {
+        self.connection
+            .path()
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| JournalError("durable child agents require a file journal".into()))
+    }
     pub fn open(path: &Path) -> Result<Self, JournalError> {
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;

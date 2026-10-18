@@ -126,6 +126,18 @@ impl Journal {
             serde_json::json!({"started_at":clock.map(|v|v.0),"deadline_at":clock.and_then(|v|v.1),"reserved_tokens":u64::try_from(tokens).map_err(|_|"accounting overflow")?,"reserved_dollar_micros":u64::try_from(micros).map_err(|_|"accounting overflow")?,"reservations":rows}),
         )
     }
+    pub(crate) fn attenuate_resource_deadline(
+        &mut self,
+        run: &str,
+        deadline: i64,
+    ) -> Result<(), String> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db)?;
+        tx.execute("UPDATE run_resources SET deadline_at=CASE WHEN deadline_at IS NULL THEN ?2 ELSE MIN(deadline_at,?2) END WHERE run_id=?1",params![run,deadline]).map_err(db)?;
+        tx.commit().map_err(db)
+    }
     pub(crate) fn initialize_resources(
         &mut self,
         run: &str,
@@ -217,6 +229,20 @@ impl Journal {
         let active:u64=tx.query_row("SELECT COUNT(*) FROM resource_reservations WHERE run_id=?1 AND ((?2='model' AND category='model') OR (?2!='model' AND category!='model')) AND state='active'",params![run,category],|r|r.get(0)).map_err(db)?;
         if active >= concurrency as u64 {
             return Ok(Admission::Blocked);
+        }
+        if category == "child" {
+            let reservation:Option<i64>=tx.query_row("SELECT id FROM resource_reservations WHERE run_id=?1 AND seq=?2 AND category='child' AND state='interrupted' ORDER BY id DESC LIMIT 1",params![run,seq],|r|r.get(0)).optional().map_err(db)?;
+            if let Some(id) = reservation {
+                // Rejoining a deterministic child does not launch a second child
+                // or reserve its already assigned resources again.
+                tx.execute(
+                    "UPDATE resource_reservations SET state='active' WHERE id=?1",
+                    [id],
+                )
+                .map_err(db)?;
+                tx.commit().map_err(db)?;
+                return Ok(Admission::Ready);
+            }
         }
         if let Some(rate) = rate {
             let cutoff = now

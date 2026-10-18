@@ -45,7 +45,7 @@ counts when total usage (or both component counts) is supplied. Dollar usage
 requires both component counts and uses the configured prices, rounding each
 component up to a micro. Unknown usage, transport failures, interrupted attempts,
 and canceled requests retain their estimates. Restart releases active slots but
-retains financial reservations and rate history. Retrying an interrupted request
+retains financial reservations and rate history. Retrying an interrupted external provider/tool request
 makes a fresh reservation because the provider may charge again.
 
 The elapsed clock starts when the run record is committed and includes parked

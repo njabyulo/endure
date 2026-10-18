@@ -49,6 +49,7 @@ fn call(
             name: "tool.mcp".into(),
             args: json!({"name":name,"arguments":arguments}),
             network_url: Some(endpoint),
+            required_child: None,
             required_tool: Some(name),
             task: Box::new(move |cancellation| call.run(cancellation)),
         };

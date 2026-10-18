@@ -360,3 +360,40 @@ fn tokio_caller_can_complete_fetch_and_await_json() {
     assert_eq!(output.stdout, "1\n");
     assert_eq!(witness.finish(), 1);
 }
+
+#[test]
+fn witness_waits_for_declared_post_body_split_from_headers() {
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+        time::Duration,
+    };
+    let witness = Witness::new(200, r#"{"received":true}"#);
+    let url = url::Url::parse(&witness.url()).unwrap();
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let body = vec![b'x'; 32 * 1024];
+    write!(
+        stream,
+        "POST /hit HTTP/1.1\r\nHost: fixture\r\ncontent-length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    let mut probe = [0];
+    let early = stream.read(&mut probe);
+    assert!(
+        matches!(early,Err(ref error) if matches!(error.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::TimedOut)),
+        "fixture responded or closed before receiving the declared POST body: {early:?}"
+    );
+    stream.write_all(&body[..4096]).unwrap();
+    stream.write_all(&body[4096..]).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.ends_with(r#"{"received":true}"#));
+    assert_eq!(witness.finish(), 1);
+}
