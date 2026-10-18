@@ -97,7 +97,11 @@ pub struct HostConfig {
     pub grants: Capabilities,
     /// Credential names map to environment-variable names, never secret values.
     pub credentials: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "context_limits_default")]
     pub context_limits: crate::ContextLimits,
+}
+fn context_limits_default(value: &crate::ContextLimits) -> bool {
+    *value == crate::ContextLimits::default()
 }
 impl HostConfig {
     pub fn validate(&self) -> Result<(), String> {
@@ -169,6 +173,19 @@ mod tests {
         std::fs::write(&path, "permissions: [net]").unwrap();
         assert!(HostConfig::load_optional(&path).unwrap().is_none());
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn default_context_limits_preserve_previous_request_identity() {
+        let config = HostConfig::default();
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"grants": {"network_origins": [], "tools": [], "memory_scopes": [], "child_agents": []}, "credentials": {}})
+        );
+        assert_eq!(
+            serde_json::from_value::<HostConfig>(encoded).unwrap(),
+            config
+        );
     }
     #[test]
     fn requests_can_only_attenuate_grants() {
