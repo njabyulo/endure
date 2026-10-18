@@ -36,6 +36,7 @@ pub(crate) struct Session {
     pub(crate) input: Value,
     pub(crate) host_config: Option<HostConfig>,
     waits: BTreeMap<u32, WaitRecord>,
+    resource_deadline: Option<i64>,
 }
 
 impl Session {
@@ -97,6 +98,13 @@ impl Session {
                 &snapshot.to_string(),
             )
             .map_err(|e| e.to_string())?;
+        journal.initialize_resources(
+            id,
+            &host_config.map(|c| c.resources.clone()).unwrap_or_default(),
+            epoch_millis()?,
+            false,
+        )?;
+        let resource_deadline = journal.resource_deadline(id)?;
         Ok(Self {
             _lease: lease,
             journal,
@@ -112,6 +120,7 @@ impl Session {
             input,
             host_config: host_config.cloned(),
             waits: BTreeMap::new(),
+            resource_deadline,
         })
     }
 
@@ -125,7 +134,7 @@ impl Session {
         id: &str,
         lease: RunLease,
     ) -> Result<(ModuleGraph, Policy, Self), String> {
-        let journal = Journal::open(path).map_err(|e| e.to_string())?;
+        let mut journal = Journal::open(path).map_err(|e| e.to_string())?;
         let record = journal.get_run(id).map_err(|e| e.to_string())?;
         let snapshot: Value = serde_json::from_str(&record.graph).map_err(|e| e.to_string())?;
         let graph: ModuleGraph =
@@ -145,6 +154,16 @@ impl Session {
         if let Some(config) = &host_config {
             config.validate()?;
         }
+        journal.initialize_resources(
+            id,
+            &host_config
+                .as_ref()
+                .map(|c| c.resources.clone())
+                .unwrap_or_default(),
+            epoch_millis()?,
+            true,
+        )?;
+        let resource_deadline = journal.resource_deadline(id)?;
         let operations = journal.operations(id).map_err(|e| e.to_string())?;
         for (index, op) in operations.iter().enumerate() {
             if op.seq != index as u64 {
@@ -167,6 +186,7 @@ impl Session {
             input: snapshot.get("input").cloned().unwrap_or(Value::Null),
             host_config,
             waits: BTreeMap::new(),
+            resource_deadline,
         };
         Ok((graph, policy, session))
     }
@@ -340,6 +360,14 @@ impl Session {
 
     pub(crate) fn ready_wait(&mut self) -> Result<Option<(u32, Value)>, String> {
         let now = epoch_millis()?;
+        if self.resource_deadline.is_some_and(|at| now >= at) {
+            if let Some((&id, _)) = self.waits.iter().find(|(_, wait)| wait.answer.is_none()) {
+                return Ok(Some((
+                    id,
+                    serde_json::json!({"Err":"BudgetError: elapsed deadline exceeded"}),
+                )));
+            }
+        }
         let ready = self
             .waits
             .iter()
@@ -373,7 +401,11 @@ impl Session {
     }
 
     pub(crate) fn next_wake(&self) -> Option<i64> {
-        self.waits.values().filter_map(|wait| wait.wake_at).min()
+        self.waits
+            .values()
+            .filter_map(|wait| wait.wake_at)
+            .chain(self.resource_deadline)
+            .min()
     }
 
     pub(crate) fn should_park(&self) -> bool {
@@ -402,6 +434,32 @@ impl Session {
     }
 
     /// Commit a dispatch attempt before contacting an external adapter.
+    pub(crate) fn admit_resource(
+        &mut self,
+        id: u32,
+        name: &str,
+        args: &Value,
+    ) -> Result<super::resources::Admission, String> {
+        self.flush()?;
+        let seq = *self
+            .pending
+            .get(&id)
+            .ok_or("operation missing from session")?;
+        let limits = self
+            .host_config
+            .as_ref()
+            .map(|c| c.resources.clone())
+            .unwrap_or_default();
+        self.journal
+            .admit_resource(&self.run_id, seq, name, args, &limits, epoch_millis()?)
+    }
+    pub(crate) fn deadline_expired(&self) -> bool {
+        !self.sealed
+            && self
+                .resource_deadline
+                .is_some_and(|at| epoch_millis().is_ok_and(|now| now >= at))
+    }
+
     pub(crate) fn begin_dispatch(&mut self, id: u32) -> Result<OperationIdentity, String> {
         self.flush()?;
         let sequence = self.operation_sequence(id)?;
@@ -564,6 +622,12 @@ pub(crate) fn wait_ready(wait: &WaitRecord, now: i64) -> bool {
 
 pub(crate) fn can_remain_parked(journal: &Journal, run_id: &str) -> Result<bool, String> {
     let now = epoch_millis()?;
+    if journal
+        .resource_deadline(run_id)?
+        .is_some_and(|at| now >= at)
+    {
+        return Ok(false);
+    }
     let pending: Vec<_> = journal
         .operations(run_id)
         .map_err(|e| e.to_string())?

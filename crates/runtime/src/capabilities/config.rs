@@ -101,6 +101,8 @@ pub struct HostConfig {
     pub context_limits: crate::ContextLimits,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<crate::integrations::model::ModelConfig>,
+    #[serde(skip_serializing_if = "crate::ResourceLimits::is_default")]
+    pub resources: crate::ResourceLimits,
 }
 fn context_limits_default(value: &crate::ContextLimits) -> bool {
     *value == crate::ContextLimits::default()
@@ -119,6 +121,7 @@ impl HostConfig {
                 return Err("model credential reference is not configured".into());
             }
         }
+        self.resources.validate()?;
         for reference in self.credentials.values() {
             let mut bytes = reference.bytes();
             if !bytes

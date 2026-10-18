@@ -455,7 +455,7 @@ mod tests {
         .unwrap();
         let original = t.journal.operations("run").unwrap();
         let connection = rusqlite::Connection::open(&t.path).unwrap();
-        connection.execute_batch("DROP TABLE context_compactions; DROP TABLE context_messages; DROP TABLE shared_state; DROP TRIGGER memory_insert; DROP TABLE memory_search; DROP TABLE memory_facts; PRAGMA user_version=2;").unwrap();
+        connection.execute_batch("DROP TABLE resource_reservations; DROP TABLE run_resources; DROP TABLE context_compactions; DROP TABLE context_messages; DROP TABLE shared_state; DROP TRIGGER memory_insert; DROP TABLE memory_search; DROP TABLE memory_facts; PRAGMA user_version=2;").unwrap();
         drop(connection);
         let reopened = Journal::open(&t.path).unwrap();
         assert_eq!(reopened.operations("run").unwrap(), original);
@@ -464,7 +464,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             connection
