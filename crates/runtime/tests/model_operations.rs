@@ -353,8 +353,19 @@ fn model_process_worker() {
     let p = Project(PathBuf::from(root));
     let config: HostConfig =
         serde_json::from_slice(&fs::read(p.0.join("config.json")).unwrap()).unwrap();
-    p.run(&config);
+    let graph = p.graph();
+    let journal = p.journal();
+    // A worker failure must preserve the fixture journal for parent inspection.
     std::mem::forget(p);
+    run_request_with_config(
+        &config,
+        &graph,
+        &journal,
+        "request",
+        "null",
+        RunLimits::default(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -586,4 +597,68 @@ fn configured_model_timeout_commits_unknown_outcome_and_replays_without_dispatch
         error.message
     );
     assert_eq!(fixture.hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn echoed_model_credentials_in_values_or_keys_are_rejected_before_delivery() {
+    let secret = "fixture-private-token-do-not-record";
+    for (secret, response) in [
+        (
+            secret,
+            json!({"choices":[{"message":{"content":format!("echo {secret}")}}]}),
+        ),
+        (
+            secret,
+            json!({"choices":[{"message":{"content":"public"}}],"metadata":{(secret):"hidden"}}),
+        ),
+        (
+            secret,
+            json!({"choices":[{"message":{"content":"public"}}],"metadata":[{"value":secret}]}),
+        ),
+        (
+            "123456789",
+            json!({"choices":[{"message":{"content":"public"}}],"usage":{"total_tokens":123456789}}),
+        ),
+    ] {
+        let fixture = Fixture::new(200, response.to_string());
+        let p = Project::new(&fixture.origin(), "ctx.model.call('Hello')");
+        let mut config = fixture.config();
+        config
+            .credentials
+            .insert("provider".into(), "ONDURE_TEST_MODEL_SECRET".into());
+        config.model.as_mut().unwrap().credential = Some("provider".into());
+        fs::write(
+            p.0.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "model_process_worker", "--nocapture"])
+            .env("ONDURE_MODEL_TEST_PROJECT", &p.0)
+            .env("ONDURE_TEST_MODEL_SECRET", secret)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        let journal = Journal::open(&p.journal()).unwrap();
+        let run = journal.find_request("request").unwrap().unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(!run.graph.contains(secret));
+        assert!(!run.stdout.contains(secret));
+        assert!(!run.stderr.contains(secret));
+        let operations = journal.operations(&run.id).unwrap();
+        assert!(operations[0]
+            .result
+            .as_ref()
+            .unwrap()
+            .contains("contained a host credential"));
+        assert!(!serde_json::to_string(&operations).unwrap().contains(secret));
+        assert!(!serde_json::to_string(&journal.attempts(&run.id).unwrap())
+            .unwrap()
+            .contains(secret));
+        let replay = runtime::replay_run(&p.journal(), &run.id, None).unwrap_err();
+        assert!(replay.message.contains("contained a host credential"));
+        assert_eq!(fixture.hits.load(Ordering::SeqCst), 1);
+    }
 }

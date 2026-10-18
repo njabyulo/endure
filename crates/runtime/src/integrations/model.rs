@@ -4,8 +4,8 @@ use crate::{
         embedding::set_property,
         event_loop::JsonJob,
         operations::{
-            validate_json, OperationCancellation, RecoveryPolicy, MAX_OPERATION_ARGUMENT_BYTES,
-            MAX_OPERATION_RESULT_BYTES,
+            contains_secret, validate_json, OperationCancellation, RecoveryPolicy,
+            MAX_OPERATION_ARGUMENT_BYTES, MAX_OPERATION_RESULT_BYTES,
         },
     },
     host::HostState,
@@ -262,15 +262,22 @@ fn execute(
         .timeout(Duration::from_secs(config.timeout_seconds))
         .set("Content-Type", "application/json")
         .set("Accept", "application/json");
-    if let Some(reference) = &config.credential {
-        let variable = credentials
-            .get(reference)
-            .ok_or("model credential reference is not configured")?;
-        let secret = std::env::var(variable)
-            .map_err(|_| "model credential environment variable is unavailable")?;
-        if secret.is_empty() || secret.contains(['\r', '\n']) {
-            return Err("model credential is invalid".into());
-        }
+    let secret = config
+        .credential
+        .as_ref()
+        .map(|reference| {
+            let variable = credentials
+                .get(reference)
+                .ok_or("model credential reference is not configured")?;
+            let secret = std::env::var(variable)
+                .map_err(|_| "model credential environment variable is unavailable")?;
+            if secret.is_empty() || !secret.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+                return Err("model credential is invalid");
+            }
+            Ok(secret)
+        })
+        .transpose()?;
+    if let Some(secret) = &secret {
         call = call.set("Authorization", &format!("Bearer {secret}"));
     }
     cancellation.check()?;
@@ -294,6 +301,12 @@ fn execute(
     cancellation.check()?;
     let response: Value =
         serde_json::from_slice(&bytes).map_err(|_| "model response is not valid JSON")?;
+    if secret
+        .as_ref()
+        .is_some_and(|secret| contains_secret(&response, secret))
+    {
+        return Err("model response contained a host credential".into());
+    }
     normalize(response)
 }
 fn normalize(response: Value) -> Result<Value, String> {

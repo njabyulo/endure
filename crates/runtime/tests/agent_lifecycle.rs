@@ -393,3 +393,146 @@ fn script_approval_rejects_notes_without_committing_an_answer() {
         "true\n"
     );
 }
+
+#[test]
+fn new_agent_graphs_do_not_install_the_legacy_ondure_global() {
+    let p = Project::new("import {agent} from 'ondure'; console.log(typeof globalThis.ondure); export default agent('clean-context',async ctx=>{ console.log(typeof globalThis.ondure); await ctx.sleep(0); });");
+    let run = run_request(
+        &Policy::default(),
+        &p.graph(),
+        &p.journal(),
+        "request",
+        "null",
+    )
+    .unwrap();
+    assert_eq!(run.stdout, "undefined\nundefined\n");
+    assert_eq!(
+        replay_run(&p.journal(), &run.id, None).unwrap().stdout,
+        run.stdout
+    );
+}
+
+#[test]
+fn legacy_captured_agents_keep_global_approval_through_parking_and_completed_replay() {
+    for captured_returns in [false, true] {
+        let p = Project::new("import {agent} from 'ondure';export default agent('legacy',async()=>{console.log(typeof ondure);console.log(await ondure.approve({action:'legacy approval'}));});");
+        let graph = p.graph();
+        let mut snapshot = serde_json::json!({"graph":graph,"net":false,"input":null});
+        if captured_returns {
+            snapshot["agent_returns"] = true.into();
+        }
+        let mut journal = Journal::open(&p.journal()).unwrap();
+        journal
+            .create_run(
+                "legacy",
+                None,
+                graph.code_hash(),
+                "legacy-identity",
+                &snapshot.to_string(),
+            )
+            .unwrap();
+        let parked = replay_run(&p.journal(), "legacy", None).unwrap();
+        assert_eq!(journal.get_run("legacy").unwrap().status, "parked");
+        assert_eq!(parked.stdout, "object\n");
+        let seq = journal.waits("legacy").unwrap()[0].seq;
+        let done = approve_run_with_note_and_limits(
+            &p.journal(),
+            "legacy",
+            seq,
+            true,
+            None,
+            RunLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(done.stdout, "object\ntrue\n");
+        assert_eq!(
+            replay_run(&p.journal(), "legacy", None).unwrap().stdout,
+            done.stdout
+        );
+    }
+}
+
+#[test]
+fn new_child_of_legacy_captured_parent_inherits_global_api_compatibility() {
+    let p = Project::new("import {agent} from 'ondure';export default agent('legacy-parent',{capabilities:{child_agents:['worker']}},async ctx=>console.log(await ctx.agents.run('worker',null)));");
+    fs::write(p.0.join("child.js"),"import {agent} from 'ondure';export default agent('legacy-child',async()=>await ondure.approve({action:'legacy child approval'}));").unwrap();
+    let graph = p.graph();
+    let child = ModuleGraph::load(&p.0.join("child.js")).unwrap();
+    let config: runtime::HostConfig = serde_json::from_value(serde_json::json!({
+        "grants":{"child_agents":["worker"]},
+        "agents":{"worker":{"module":"child.js","allocation":{"tokens":1,"dollar_micros":1}}}
+    }))
+    .unwrap();
+    let snapshot = serde_json::json!({"graph":graph,"net":false,"input":null,"agent_returns":true,"host_config":config,"children":{"worker":child},"child_depth":0});
+    let mut journal = Journal::open(&p.journal()).unwrap();
+    journal
+        .create_run(
+            "legacy-parent",
+            None,
+            graph.code_hash(),
+            "legacy-identity",
+            &snapshot.to_string(),
+        )
+        .unwrap();
+    replay_run(&p.journal(), "legacy-parent", None).unwrap();
+    assert_eq!(journal.get_run("legacy-parent").unwrap().status, "parked");
+    let sequence = journal
+        .operations("legacy-parent")
+        .unwrap()
+        .into_iter()
+        .find(|op| op.name == "agent.run")
+        .unwrap()
+        .seq;
+    let child = journal
+        .find_request(&format!("child:legacy-parent:{sequence}"))
+        .unwrap()
+        .unwrap();
+    let captured: serde_json::Value = serde_json::from_str(&child.graph).unwrap();
+    assert_eq!(captured["agent_api_version"], 0);
+    let seq = journal.waits(&child.id).unwrap()[0].seq;
+    approve_run_with_note_and_limits(
+        &p.journal(),
+        &child.id,
+        seq,
+        true,
+        None,
+        RunLimits::default(),
+    )
+    .unwrap();
+    let done = wake_ready(&p.journal())
+        .unwrap()
+        .into_iter()
+        .find(|outcome| outcome.run_id == "legacy-parent")
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(done.stdout, "true\n");
+    assert_eq!(
+        replay_run(&p.journal(), "legacy-parent", None)
+            .unwrap()
+            .stdout,
+        done.stdout
+    );
+}
+
+#[test]
+fn unsupported_captured_agent_api_version_fails_before_execution() {
+    let p=Project::new("import {agent} from 'ondure';export default agent('future',()=>console.log('must not execute'));");
+    let graph = p.graph();
+    let snapshot = serde_json::json!({"graph":graph,"net":false,"agent_api_version":2});
+    Journal::open(&p.journal())
+        .unwrap()
+        .create_run(
+            "future",
+            None,
+            graph.code_hash(),
+            "future",
+            &snapshot.to_string(),
+        )
+        .unwrap();
+    let error = replay_run(&p.journal(), "future", None).unwrap_err();
+    assert!(error
+        .message
+        .contains("unsupported captured agent API version"));
+    assert!(error.output.stdout.is_empty());
+}

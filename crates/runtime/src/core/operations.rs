@@ -86,6 +86,22 @@ pub(crate) fn approval_outcome(answer: &str) -> Result<Value, String> {
     Ok(outcome)
 }
 
+/// Inspect decoded provider strings, keys, and canonical scalar text before
+/// committing a response. This exact match check does not decode obfuscations.
+pub(crate) fn contains_secret(value: &Value, secret: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    match value {
+        Value::String(text) => text.contains(secret),
+        Value::Array(values) => values.iter().any(|value| contains_secret(value, secret)),
+        Value::Object(values) => values
+            .iter()
+            .any(|(key, value)| key.contains(secret) || contains_secret(value, secret)),
+        Value::Number(_) | Value::Bool(_) | Value::Null => value.to_string().contains(secret),
+    }
+}
+
 /// Cooperative adapter cancellation. Cancellation cannot undo external effects.
 #[derive(Clone, Default)]
 pub struct OperationCancellation(Arc<AtomicBool>);
@@ -117,6 +133,30 @@ impl Drop for CancellationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credential_detection_checks_strings_nested_arrays_and_object_keys() {
+        for value in [
+            serde_json::json!("prefix private-token suffix"),
+            serde_json::json!({"nested":[{"private-token":"value"}]}),
+            serde_json::json!([null,{"key":"private-token"}]),
+        ] {
+            assert!(contains_secret(&value, "private-token"));
+        }
+        assert!(!contains_secret(
+            &serde_json::json!({"public":"value"}),
+            "private-token"
+        ));
+        for (value, secret) in [
+            (serde_json::json!({"nested":[123456789]}), "123456789"),
+            (serde_json::json!(true), "true"),
+            (serde_json::json!(false), "false"),
+            (Value::Null, "null"),
+        ] {
+            assert!(contains_secret(&value, secret));
+        }
+        assert!(!contains_secret(&serde_json::json!(987654321), "123456789"));
+        assert!(!contains_secret(&Value::Null, ""));
+    }
     #[test]
     fn validates_names_and_json_limits() {
         assert!(OperationSpec::new("fetch.get", RecoveryPolicy::RetrySafe)

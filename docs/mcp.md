@@ -24,7 +24,9 @@ mcp_servers:
 Aliases are unique across configured servers. The credential field names a key
 in `credentials`; the host resolves that environment-variable reference only
 inside adapter execution. Credential values are absent from operation arguments
-and snapshots. Responses containing the resolved credential are rejected.
+and snapshots. Responses containing the resolved credential in decoded strings, object keys,
+or canonical JSON number/boolean/null text are rejected. This exact reflection
+check does not detect arbitrary encoded or obfuscated forms.
 
 This is a bounded Streamable HTTP tools profile: initialization negotiates
 2025-11-25, 2025-06-18, or 2025-03-26; requests use the negotiated version and

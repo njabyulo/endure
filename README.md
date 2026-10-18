@@ -1,321 +1,229 @@
 # Ondure
 
-Run JavaScript and TypeScript ES modules in an embedded V8 isolate with
-policy-controlled network access. Top-level `await` is supported. The host provides `console.log`, `console.error`,
-a minimal GET-only `fetch` with `ok`, `status`, and promise-returning `json()`,
-and one-shot `setTimeout` / `clearTimeout` timers.
+Ondure is a Rust host for durable JavaScript and TypeScript agent workflows.
+V8 executes captured local modules; SQLite records registered host operations,
+waits and outcomes. Recovery reconstructs execution in a fresh isolate and reuses
+committed outcomes before continuing supported unfinished work.
 
-## Build and run
+This feature-series branch contains bounded first versions of seven runtime
+features. It is a source build for review; no package distribution, production
+readiness or measured performance is claimed.
 
-```sh
-cargo build --release --bin ondure
-mkdir -p build
-cp target/release/ondure build/ondure
-./build/ondure run examples/agent.js
-```
-
-The first build needs internet for dependencies and the prebuilt V8 archive.
-
-## Modules and TypeScript
+## Build and try
 
 ```sh
-./build/ondure run examples/typescript/agent.ts
+cargo build --bin ondure
+python3 examples/model-operations/run.py
+python3 examples/standard-interfaces/run.py
+python3 examples/onboarding/run.py
 ```
 
-This example imports `./greeting.ts` and awaits a timer without a build step.
-SWC removes TypeScript syntax; V8 links and executes the resulting ES modules.
-Types are not checked. `.js` entries also use ES module semantics, including
-strict mode and module-local declarations.
+Rust and Python 3 are required for these local fixtures. The first build downloads
+dependencies and the V8 archive. Examples use local receivers and temporary
+journals; no paid credentials are required. Optional live-model configuration is
+in [the model example](examples/model-operations/README.md).
 
-Imports must start with `./` or `../` and name an explicit `.js` or `.ts` file.
-They resolve relative to the importing module and must stay inside the entry
-file's canonical parent directory, including after symlink resolution. Place
-shared code beneath that directory. Shared dependencies execute once per run;
-cycles and re-exports use V8's module linker.
+## Agent entrypoint
 
-`import type` declarations disappear without loading their targets. Inline type
-bindings follow verbatim TypeScript semantics: `import { type T } from './x.ts'`
-can retain `x.ts` for its side effects. No `.swcrc` or `tsconfig.json` is loaded.
-CommonJS, package and remote imports, extension guessing, dynamic imports,
-`.d.ts` execution, JSX, and decorators are unsupported. Dynamic imports in
-prepared source fail preparation; expressions constructed through `eval` reject
-at runtime without loading code.
+```js
+import { agent } from "ondure";
 
-Preparation errors identify the file and available source location. Runtime
-stack locations refer to emitted JavaScript; source-map remapping is not provided.
-If top-level await is still pending after all host work finishes, the run fails
-with a pending-evaluation error instead of reporting success.
+export default agent("review", async (ctx, input) => {
+  await ctx.context.add({ role: "user", content: input.message });
+  const decision = await ctx.human.approve({
+    action: "Continue onboarding?",
+    recipient: "trusted local operator",
+    timeout: "1h",
+    onTimeout: "reject",
+  });
+  return { approved: decision.approved, note: decision.note };
+});
+```
 
-## Code identity for Rust callers
+Both `agent(name, handler)` and `agent(name, options, handler)` are supported.
+The host invokes the default agent after module evaluation with native context
+and persisted JSON input. Use `--request` to bind input to request identity:
 
-`ModuleGraph::load(&Path)` captures the reachable execution graph in memory.
-`graph.code_hash()` returns its SHA-256 identity. The hash covers a versioned,
-length-prefixed encoding of the entry ID, sorted relative module IDs, raw source,
-emitted JavaScript, and resolved import edges. Absolute checkout paths are not
-included. Type-only dependencies erased during transpilation are not loaded or
-hashed; the importing source itself is hashed.
+```sh
+cargo run -p ondure -- run examples/agent-lifecycle/main.ts --request review-demo --input '{"name":"Ada"}'
+cargo run -p ondure -- wake
+# Inspect the printed run ID and use its approval wait sequence:
+cargo run -p ondure -- log RUN_ID
+cargo run -p ondure -- approve RUN_ID WAIT_SEQ yes --note 'Reviewed locally'
+```
 
-`run_module(&policy, &graph, Some(expected_hash))` verifies a previously recorded
-hash before creating the isolate or executing code. Use `None` for a fresh run.
-Both paths execute captured code without rereading files, even if the original
-files change or disappear. Loading is not an atomic filesystem snapshot.
+`wake` is a local scheduler tick, not a background daemon. Invoke it from an
+external scheduler to wake ready waits and recover abandoned runs. Recipient
+labels do not provide remote authentication or delivery. The first committed
+approval answer or rejection timeout wins.
 
-The CLI persists graph snapshots and hashes with journaled runs. In-memory
-`run_module` remains available without journaling. Replay uses the captured graph and verifies its integrity; code identity does
-not pin engine versions.
-All compilation and hashing dependencies belong to the runtime crate.
+## Seven features
 
-## Permissions
+| Feature | Supported boundary | Runnable example |
+| --- | --- | --- |
+| Durable execution | Intent before dispatch, outcome before delivery, captured code and completed-result reuse | [Operations](examples/operations.md), [onboarding interruption](examples/onboarding/README.md) |
+| Capabilities | Requested authority intersects operator grants; exact origins, tool names, memory scopes and child names | [Allowed and denied dispatch](examples/capabilities/README.md), [MCP denial](examples/mcp/README.md) |
+| Memory | Awaited context, SQLite full-text remember/recall, versioned shared get/set/compareAndSet | [Context, retrieval and CAS](examples/agent-memory/README.md) |
+| Budgets and scheduling | Durable token/spend reservations, model/tool concurrency and rate admission, elapsed deadlines | [Resource budgets](examples/resource-budgets/README.md) |
+| Replay and observability | Structured operations/attempts, recorded inputs/outcomes, inspect and compare | [Inspection and diff](examples/inspection.md) |
+| Human approval | Persisted waits, notes and rejection timeouts across restarts | [Lifecycle](examples/agent-lifecycle/README.md) |
+| Standard interfaces | Configured MCP Streamable HTTP tools and captured local children with delegated resources | [Tools and children](examples/standard-interfaces/README.md), [child agents](examples/child-agents/README.md) |
 
-`ondure` reads `./ondure.yaml` from the current working directory:
+Agent APIs include `ctx.sleep(duration)`, `ctx.human.approve(details)`,
+`ctx.model.call(promptOrMessagesOrOptions)`, `ctx.context.add(message)`,
+`ctx.context.messages()`, `ctx.memory.remember/recall`, `ctx.state.get/set/compareAndSet`,
+`ctx.tools.call(name, arguments)` and `ctx.agents.run(name, input)`.
+
+Durations accept integer milliseconds or strings such as `"1s"`, `"15m"`, `"1h"`
+and `"2d"`. Shared memory/state scopes require explicit requests and grants.
+Context belongs to the run; defaults are 128 messages and 256 KiB, preserving
+system and recent messages. Compaction archives removed content and records its
+decisions. Oversized protected context is rejected. Retrieval is lexical FTS5,
+not embeddings. State mutations and their outcomes commit atomically.
+
+## Trusted host configuration
+
+The CLI loads `ondure.yaml` from its working directory. Missing authority is denied.
 
 ```yaml
-permissions: []
+grants:
+  network_origins: ["http://127.0.0.1:8787"]
+  memory_scopes: ["demo"]
+credentials:
+  provider: ONDURE_PROVIDER_KEY
+model:
+  endpoint: http://127.0.0.1:8787/v1/chat/completions
+  model: fixture
+  max_output_tokens: 32
+  retry_interrupted: false
+resources:
+  token_limit: 10000
+  dollar_limit_micros: 2000000 # USD 2 using configured prices
+  model_concurrency: 2
+  tool_concurrency: 4
+  model_rate: { max_calls: 10, window_ms: 60000 }
+  elapsed_deadline_ms: 900000
 ```
 
-Empty permissions or a missing file denies network with `permission denied: net`.
-Use `permissions: [net]` to allow network. Unknown permission names fail to load.
-Allowed requests need a reachable server at the script's destination. A caught
-denial exits successfully. Use `examples/agent.js` for your own experiments;
-integration tests provide their own scripts and local servers.
+The agent requests capabilities through `options.capabilities` using the same
+capability field names. Requests never elevate operator grants. Agent module
+initialization starts denied; host checks apply at dispatch. Network origins are
+exact canonical scheme/host/port origins; scoped adapters do not automatically
+follow redirects. These controls are not IP filtering, DNS rebinding protection
+or an OS sandbox.
 
-## Async execution
+Credential configuration stores environment-variable names, not values. Model
+and MCP adapters resolve secrets inside the host at dispatch and reject reflected
+credential responses before delivery. Application prompts, results and archived
+context can contain sensitive data; control journal and inspection access.
 
-`fetch` returns a pending promise immediately. HTTP runs on Tokio's blocking
-worker pool with the existing 10-second request timeout; JavaScript and all V8
-handles stay on the host thread. Multiple requests can run concurrently.
+The complete trusted configuration and request input participate in request
+identity. Matching retries reuse the same run; changed code, input or config
+conflicts. Runs use captured grants when resumed. Editing today's YAML does not
+revoke a persisted run. Local journal and run/lease access are trusted operator
+capabilities. This is not a distributed executor.
 
-```js
-const response = await fetch('http://127.0.0.1:8787/hit');
-console.log(await response.json());
-```
+See [capability details](docs/capabilities.md), [MCP protocol profile](docs/mcp.md)
+and the resource/child example documentation for configuration and limits.
 
-`setTimeout(callback, delayMs, ...args)` returns a numeric ID for `clearTimeout`.
-Callbacks run once, after synchronous JavaScript and its microtasks. Missing,
-NaN, or negative delays become zero; delays are capped at 2,147,483,647 ms.
-String callbacks are unsupported. Run the timer example without network access:
+## Durability, retry and accounting
+
+Every registered operation has `(run ID, sequence)` identity, validated JSON,
+explicit recovery policy and a recorded outcome. External dispatch attempts are
+committed before invoking adapters. New encoded arguments are bounded to 256 KiB
+and outcomes to 1 MiB; migrated completed history remains replayable. Additive,
+versioned journal migrations preserve existing journals.
+
+Committed results replay without another provider/tool request. A new intent
+with no recorded dispatch attempt can resume. After an uncertain dispatch,
+unsafe operations stop for reconciliation; only explicitly retryable operations
+may repeat. Legacy ambiguous records remain conservative. A crash after a receiver
+accepted a request but before local outcome commit remains uncertain. The
+onboarding mock uses receiver idempotency keys; it establishes no general
+exactly-once effect guarantee.
+
+Model support is one non-streaming text Chat Completions schema, not universal
+provider compatibility. Retried interrupted requests may incur additional charges.
+Resource admission reserves configured token/spend estimates before dispatch,
+reconciles available usage using configured prices, and retains reservations when
+usage is unknown. Dollar micros are millionths of USD. These are conservative
+runtime accounts, not an exact provider billing cap. Exhaustion records an error
+and preserves history. Elapsed deadlines include parked time.
+
+Cancellation is cooperative: it prevents late delivery and further dispatch in
+the canceled execution. It cannot undo external effects or promise provider-side
+cancellation. Child allocations are reserved from the parent, and child authority
+and deadlines are attenuated. Completed child identity is reused on restart.
+
+Durability covers registered host operations, not every JavaScript promise,
+callback, or heap object. There is no unrestricted `ctx.step(callback)` checkpoint.
+Process-kill tests do not establish hardware power-loss durability. SQLite WAL
+with synchronous commits still relies on storage honoring synchronization requests.
+
+## Inspect and replay
 
 ```sh
-./build/ondure run examples/timers.js
+cargo run -p ondure -- log RUN_ID
+cargo run -p ondure -- explain RUN_ID
+cargo run -p ondure -- diff RUN_A RUN_B
+cargo run -p ondure -- replay RUN_ID
 ```
 
-The event loop waits for submitted HTTP operations and uncanceled timers,
-including work submitted by their continuations. An unresolved JavaScript promise
-alone does not keep the runtime alive. Microtasks drain between completions.
+The default journal is `.ondure/journal.sqlite3`; use `--journal PATH` on commands
+to select another. `run` prints generated run IDs before execution; explicit
+`--run-id` values cannot replace an existing run. Request identity supplies retry
+deduplication rather than run replacement.
 
-If a script or timer callback throws, submitted work still completes before the
-first uncaught error is reported. Unhandled promise rejections are checked at
-idle. Output from the entire run is retained on failure. Infinite JavaScript or
-endlessly scheduled work can still prevent exit; CPU limits and cancellation of
-HTTP requests are not implemented. Recorded operations can be replayed without repeating completed effects.
+Inspection shows recorded inputs, permissions, operation outcomes/attempts,
+usage/reservations and supplied rationale. It does not expose hidden model
+reasoning or invoke adapters. `diff` compares recorded registrations and metadata;
+it does not fork execution. Replay verifies captured code, operation arguments,
+recovery policy and delivery order. Completed histories remain immutable even
+if replay diverges. Supported unfinished runs may continue live.
 
-For Rust embedding, `run_source` and `run_module` are synchronous and block until idle.
-`run_source` retains classic JavaScript script semantics and requires an async
-IIFE for `await`. `run_module` executes a prepared ES module graph. Calls
-from an entered Tokio runtime create and dispose the isolate on a separate
-thread to avoid nested runtime panics. Use Tokio's `spawn_blocking` at async
-call sites when the caller's executor must remain responsive.
+## Scripts and embedding
 
-## Check
+Ordinary ES module scripts remain available with top-level await, console,
+GET-only fetch, one-shot timers and recorded clocks/randomness in durable runs.
+Legacy `permissions: [net]` retains broad network access for ordinary scripts;
+scoped agent requests do not inherit it. Legacy durable-script globals remain
+only for compatibility and old journal replay; new agent examples use `ctx`.
+New runs record the agent API version. Captured agents without that marker keep
+their historical globals when parked, resumed, or replayed; newly created
+children inherit the captured parent's compatibility version.
+
+Relative imports must name `.js`/`.ts` files and stay inside the entry directory
+through canonical paths. The captured `"ondure"` built-in is the only package-like
+import. SWC removes TypeScript syntax without type checking. CommonJS, remote/npm
+resolution, dynamic imports, JSX and decorators are unsupported. Captured code
+identity does not pin V8 versions, timezone or locale.
+
+Rust callers can use `ModuleGraph::load`, `run_durable_with_config` and
+`run_request_with_config` with `HostConfig`/`RunLimits`. Ephemeral `run_source` and
+`run_module` and existing `Policy` APIs remain available. They block their caller;
+async hosts should use `spawn_blocking` where appropriate.
+
+The CLI supervises execution in a worker process, defaulting to a 1,000 ms active
+elapsed-execution budget and a 128 MiB V8-managed heap limit. Override with
+`--cpu-ms` and `--heap-mb` (zero disables that limit). These differ from durable
+resource budgets: waiting does not consume active execution time, each resume
+receives a fresh active allowance, and the heap limit is not total process RSS.
+Console retention is capped at a combined 8 MiB UTF-8 per execution. Native
+abort containment is a CLI process property, not a promise that all logs flush
+on native crash or that the Rust library survives fatal allocator failures.
+
+## Verify and extend
 
 ```sh
-cargo test --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace -- --test-threads=1
 ```
 
-Rust integration tests supply local HTTP listeners to verify zero denied
-connections, computed-property fetch denial, and successful JSON responses.
+Linux/macOS CI runs the supported suite. Local and remote results are reported
+separately. [Proof fixtures](docs/feature-proof.md) distinguish process-crash,
+receiver-idempotency and provider-mock evidence.
 
-## Reading the code
-
-Start with `crates/runtime/src/host.rs` for execution flow. The CLI calls its
-`run_durable` function through the public exports in `crates/runtime/src/lib.rs`,
-after preparing a `ModuleGraph`. `run_module` and `run_source` remain available
-for execution without a journal.
-Inside the runtime, each group covers a different lesson:
-
-1. `core/embedding.rs`: V8 platform initialization, isolates, and host bindings.
-   Context and handle-scope lifetimes remain visible in `host.rs`.
-2. `core/execution.rs`: source compilation, filenames, execution, and exceptions.
-   V8 owns JavaScript parsing and interpretation internally.
-3. `core/transpilation.rs`: SWC parsing, TypeScript transformation, and import discovery.
-4. `core/modules.rs`: immutable source graphs, hashing, and V8 module linking.
-5. `core/microtasks.rs`: await continuations, persistent promise handles, and
-   unhandled rejection tracking.
-6. `integrations/io.rs`: JavaScript console callbacks and captured output.
-7. `integrations/networking.rs`: fetch callbacks, permission enforcement, HTTP,
-   and response promises.
-8. `core/event_loop.rs`: operation registration, Rust completions, promise
-   settlement, and idle detection. One Tokio current-thread runtime drives each
-   isolate; HTTP workers exchange owned Rust data with it.
-9. `integrations/timers.rs`: one-shot callbacks, arguments, and cancellation.
-10. `capabilities/policy.rs`: Ondure's permission decisions and YAML loading,
-   independent of V8.
-
-The host keeps V8 scopes visible. Local handles live within those scopes;
-Global handles keep rejected promises and their reasons available for inspection.
-
-Unit tests live beside their lesson and exercise the public runtime API. For
-example, `cargo test -p runtime core::microtasks` demonstrates promise handling.
-`cargo test -p runtime --test network` exercises the networking integration with
-real local listeners.
-
-## Durable operation journal
-
-`ondure run` writes `.ondure/journal.sqlite3` by default. SQLite uses WAL and
-`synchronous=FULL`. Fetch and timer intents commit before dispatch; their results
-commit before promises settle or callbacks run. Cancellation and both success
-and failure results are recorded with a completion order. Intent batches flush
-at dispatch and at 256 entries or a 2 ms batching threshold during registration.
-Results commit before individual JS delivery; no fsync is deferred past an await.
-
-```sh
-./build/ondure run examples/typescript/agent.ts --run-id example --journal .ondure/journal.sqlite3
-./build/ondure log example
-```
-
-Run IDs are generated when omitted and printed on stderr before execution.
-Duplicate IDs fail rather than replacing a run. The Rust `run_durable` API
-provides the same boundary; `run_source` and `run_module` remain ephemeral
-embedding APIs. Captured code and the run's network
-policy are stored with the run. Console output is captured again at finalization;
-it is not an external exactly-once effect.
-
-A killed process can leave an intent without a result. Replay retries unfinished
-GET and timer operations under their `safe` policy; completed results are reused. A committed result survives process death;
-power-loss durability additionally depends on the filesystem and storage device
-honoring SQLite's synchronization requests. The crash regression kills 100
-processes after an external witness sees a JS await continuation and verifies
-that every acknowledged result remains in the journal.
-
-## Crash recovery and replay
-
-```sh
-./build/ondure replay example --journal .ondure/journal.sqlite3
-```
-
-Replay executes the captured module graph with its recorded network policy.
-It validates operation names, argument digests, replay policies, and completion
-order, supplying recorded results without opening sockets or repeating timer
-waits. After the recorded prefix it may continue an unfinished run. Completed
-runs reject unexpected extra operations. A changed graph passed through the Rust
-`replay_run` verification API fails its code-hash check before execution.
-Replaying a completed or failed run preserves its original status, output, and
-operation history, including when replay diverges. An operating-system lease
-allows only one process to execute a given run at a time and is released on
-process exit, including a crash.
-
-An intent without a result is ambiguous: a safe GET can be repeated. This is not
-an exactly-once guarantee for outside effects; unsafe tools are not exposed by
-this milestone. Divergence is fatal even if agent JavaScript catches the error.
-Console output is reconstructed during replay. Time and random values exposed through the supported durable globals are
-journaled as synchronous operations too.
-
-## Recorded time and randomness
-
-Durable runs replace `Date.now()`, no-argument `new Date()`, `Date()`,
-`performance.now()`, `Math.random()`, and `crypto.randomUUID()` with journal-backed
-bindings. Each value commits before returning to JavaScript; replay returns the
-recorded value. Explicit Date arguments, `Date.parse`, `Date.UTC`, subclasses,
-and `instanceof` retain their normal behavior. The original Date constructor is
-kept in a closure; replacing `Reflect.construct` cannot expose it.
-
-`WeakRef`, `FinalizationRegistry`, and `Temporal.Now` are removed from durable
-runs. Intl date formatting requires an explicit non-undefined date; omitted dates
-would otherwise read the current clock outside the journal. Ephemeral
-`run_source`/`run_module` embedding APIs keep their original globals. This is not
-engine/environment pinning: locale-sensitive formatting and explicit local-date
-parsing still depend on the host timezone and locale. Keep the execution
-environment stable and use UTC/explicit offsets for portable dates. Unprovided
-APIs such as workers and external entropy sources remain unavailable.
-
-Journal JSON uses round-trip float parsing so recorded random/performance values
-return identical floating-point values rather than nearby approximations.
-
-
-## Parking and request identity
-
-Durable modules can suspend without keeping an isolate or process alive:
-
-```js
-const accepted = await ondure.approve({ action: "continue" });
-if (accepted) console.log("approved");
-await ondure.sleepUntil(Date.now() + 60_000);
-console.log("awake");
-```
-
-`ondure.approve` stores JSON details and a pending approval. `ondure.sleepUntil`
-stores an absolute epoch-millisecond deadline. Both release the isolate when
-there is no other live work. Regular `setTimeout` remains an in-process timer.
-
-```sh
-./build/ondure run examples/approval.ts --run-id approval
-./build/ondure log approval
-# Use the approval wait's seq from the log:
-./build/ondure approve approval 0 yes
-./build/ondure wake
-```
-
-Approval answers commit before resumption. Repeating an identical answer is
-idempotent; changing an answer fails. `wake` resumes ready parked runs from their
-captured graph. Invoke it from an external scheduler; Ondure does not run a
-background daemon. Console output is reconstructed on resumption.
-
-`run ... --request ID --input '{"name":"reader"}'` binds a request ID to its
-code hash, policy, and JSON input. JavaScript reads the input as `ondure.input`.
-Retries return the same run and cached terminal output; changed identity fails.
-OS file locks prevent concurrent owners of the same request or run and release
-on process death. Journal and lease files must share local storage; this is not
-a distributed executor or an exactly-once guarantee for external effects.
-
-
-## Execution limits
-
-The CLI supervises execution in a disposable worker process. Defaults are a
-1,000 ms active-execution budget and a 128 MiB V8 managed-heap limit. Override
-with `--cpu-ms` and `--heap-mb` on run, replay, approve, or wake; zero disables
-that limit. Rust callers can use the `*_with_limits` APIs with `RunLimits`;
-existing embedding APIs remain unlimited.
-
-The watchdog accumulates active elapsed time across initial evaluation,
-callbacks, and microtasks. Waiting for HTTP and timers does not consume the
-budget. This is elapsed active time, not OS CPU accounting. A tight loop or
-endless microtask chain terminates, and captured logs and failed status are
-written to the journal. Each resume receives a new per-execution budget.
-
-The heap limit covers V8's managed heap, with emergency allocation headroom for
-termination. It does not bound process RSS, Rust buffers, or external allocations.
-The CLI parent contains a native worker abort and reports a nonzero exit; SQLite
-can reopen the journal and another worker can run. A native crash may leave a
-running record for replay and cannot flush in-memory console output. Process
-containment does not protect against system-wide kernel OOM. The Rust library
-alone does not contain fatal native allocation failures.
-
-
-The CLI forwards worker stdout and stderr as they arrive using fixed-size
-buffers, so generated run IDs are available while execution is still pending.
-A private liveness pipe ties the worker to the CLI parent, including abrupt
-parent termination. Stopping the public CLI stops its worker and releases the
-run lease; unfinished safe operations remain recoverable through the journal.
-
-Console output has a combined **8 MiB UTF-8 limit per execution**, including
-separators and newlines across `console.log` and `console.error`. This applies
-to Rust embedding APIs too and is exported as `MAX_OUTPUT_BYTES`. A value that
-would exceed the limit is rejected before allocating its Rust string copy;
-execution terminates with `console output limit exceeded`, preserving earlier
-captured output. The supervisor streams output without retaining another copy.
-This cap covers console retention, not every host allocation or total RSS.
-
-Agents can keep run-local conversation context, scoped lexical memory, and
-versioned shared JSON state. The [memory example](examples/agent-memory/README.md)
-includes the API contract, operator scope grants, configurable compaction limits,
-and a local runnable workflow. Memory/state mutations and their recorded outcomes
-commit atomically; completed retrievals and state results replay from the journal.
-
-Trusted `resources` configuration meters per-run token and dollar reservations,
-model/tool concurrency and rolling rate limits, and elapsed deadlines that include
-parked time. The [resource example](examples/resource-budgets/README.md) runs a
-local provider, demonstrates denial before dispatch, and verifies replay.
-Reservations use configured estimates and prices; unknown or interrupted usage
-remains reserved. These limits do not promise exact provider billing caps.
+Deferred work includes streaming, embeddings, model-generated compaction,
+execution forks/model overrides, local inference, stdio MCP, filesystem writes,
+real payment/email adapters, OS sandboxing and package/skill distribution.

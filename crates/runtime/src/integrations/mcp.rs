@@ -1,6 +1,6 @@
 //! Bounded MCP Streamable HTTP tool adapter; no subprocess or ambient discovery.
 use super::mcp_schema::{validate_instance, validate_schema};
-use crate::core::operations::validate_json;
+use crate::core::operations::{contains_secret, validate_json};
 use crate::{
     Capabilities, HostConfig, OperationCancellation, RecoveryPolicy, MAX_OPERATION_ARGUMENT_BYTES,
     MAX_OPERATION_RESULT_BYTES,
@@ -416,16 +416,7 @@ fn read_sse(reader: impl Read, id: u64) -> Result<Value, String> {
         }
     }
 }
-fn contains_secret(value: &Value, secret: &str) -> bool {
-    match value {
-        Value::String(text) => text.contains(secret),
-        Value::Array(values) => values.iter().any(|v| contains_secret(v, secret)),
-        Value::Object(values) => values
-            .iter()
-            .any(|(key, v)| key.contains(secret) || contains_secret(v, secret)),
-        Value::Number(_) | Value::Bool(_) | Value::Null => value.to_string().contains(secret),
-    }
-}
+
 fn validate_tool_result(result: &Value) -> Result<(), String> {
     if result.get("isError").is_some_and(|v| !v.is_boolean()) {
         return Err("invalid MCP tool error flag".into());
@@ -520,6 +511,8 @@ mod tests {
                                     json!({"content":[{"type":"text","text":"x".repeat(MAX_OPERATION_RESULT_BYTES+1)}]})
                                 } else if mode == "numeric_credential_echo" {
                                     json!({"content":[],"structuredContent":{"token":123456789}})
+                                } else if mode == "credential_echo_number" {
+                                    json!({"content":[{"type":"text","text":"hello"}],"structuredContent":{"greeting":"hello"},"_meta":{"echo":123456789}})
                                 } else if mode == "credential_echo" {
                                     json!({"content":[{"type":"text","text":"fixture-private-token-never-record"}],"structuredContent":{"greeting":"fixture-private-token-never-record"}})
                                 } else if mode == "bad_output" {
@@ -969,7 +962,12 @@ mod tests {
     }
     #[test]
     fn credentials_stay_in_host_and_echoed_secrets_never_enter_journal() {
-        for mode in ["json", "credential_echo", "numeric_credential_echo"] {
+        for (mode, secret) in [
+            ("json", "fixture-private-token-never-record"),
+            ("credential_echo", "fixture-private-token-never-record"),
+            ("credential_echo_number", "123456789"),
+            ("numeric_credential_echo", "123456789"),
+        ] {
             let fixture = Fixture::new(mode);
             let (directory, _, mut config) = agent_project(
                 &fixture,
@@ -984,11 +982,7 @@ mod tests {
                 serde_json::to_vec(&config).unwrap(),
             )
             .unwrap();
-            let secret = if mode == "numeric_credential_echo" {
-                "123456789"
-            } else {
-                "fixture-private-token-never-record"
-            };
+
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1019,8 +1013,18 @@ mod tests {
             assert!(!serde_json::to_string(&journal.operations("run").unwrap())
                 .unwrap()
                 .contains(secret));
+            assert!(!serde_json::to_string(&journal.attempts("run").unwrap())
+                .unwrap()
+                .contains(secret));
             assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
-            if mode.ends_with("credential_echo") {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+            if mode != "json" {
+                let methods = fixture.methods();
+                let replay =
+                    crate::replay_run(&directory.join("journal.sqlite3"), "run", None).unwrap_err();
+                assert!(replay.message.contains("contained a host credential"));
+                assert_eq!(fixture.methods(), methods);
+
                 assert!(journal.operations("run").unwrap()[0]
                     .result
                     .as_ref()

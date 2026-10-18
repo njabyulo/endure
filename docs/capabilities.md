@@ -19,19 +19,16 @@ The CLI loads `ondure.yaml` from its current working directory. The Rust APIs
 `RunLimits`. Unknown configuration keys, malformed grants, wildcards, and
 credential references that are not environment-variable names are rejected.
 Credential values remain in the host environment; configuration stores names,
-never resolved values. The capability layer does not yet dispatch configured
-tools, memory, children, or provider requests; subsequent adapters must invoke
-the same checks before dispatch.
+never resolved values. Configured model and MCP adapters, scoped memory/state,
+and local child agents apply these checks before their operations dispatch.
 
-This layer supplies and tests the host's capability-intersection boundary. It
-does not yet provide agent declarations or call `request_capabilities` from a
-production entrypoint. Ordinary scripts using scoped configuration receive the
-configured operator grants directly.
+Agent declarations request `Capabilities`; their effective authority is the
+intersection of those requests and operator grants. Empty requests grant
+nothing, and requests cannot elevate legacy broad network policy. The agent
+lifecycle applies this boundary before invoking a handler. Module initialization
+starts with empty authority. Ordinary scripts
+using scoped configuration receive the configured operator grants directly.
 
-The subsequent agent-lifecycle layer will connect agent declarations to this
-boundary before invoking their handlers. In that layer, effective authority
-will be the intersection of requested capabilities and operator grants: empty
-requests grant nothing, and requests cannot elevate legacy broad network policy.
 
 Network grants are canonical HTTP(S) origins: scheme, host, and nondefault port,
 without a trailing slash, path, credentials, query, or fragment. Granting one
