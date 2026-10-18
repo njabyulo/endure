@@ -1,10 +1,10 @@
 mod supervisor;
 
 use runtime::{
-    approve_run_with_note_and_limits, journal_log, new_run_id, replay_run_with_limits,
-    run_durable_with_config, run_durable_with_limits, run_request_with_config,
-    run_request_with_limits, wake_ready_with_limits, HostConfig, HostError, Journal, ModuleGraph,
-    Policy, RunLimits, RunOutput,
+    approve_run_with_note_and_limits, diff_runs, inspect_run, journal_log, new_run_id,
+    replay_run_with_limits, run_durable_with_config, run_durable_with_limits,
+    run_request_with_config, run_request_with_limits, wake_ready_with_limits, HostConfig,
+    HostError, Journal, ModuleGraph, Policy, RunLimits, RunOutput,
 };
 use std::{
     error::Error,
@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
 };
-const USAGE: &str = "usage: ondure run <script> [--run-id <id> | --request <id>] [--input <json>] [--journal <path>] [--cpu-ms <ms>] [--heap-mb <MiB>] | replay <run-id> | log <run-id> | approve <run-id> <wait-seq> yes|no [--note <text>] | wake";
+const USAGE: &str = "usage: ondure run <script> [--run-id <id> | --request <id>] [--input <json>] [--journal <path>] [--cpu-ms <ms>] [--heap-mb <MiB>] | replay <run-id> | log <run-id> | explain <run-id> | diff <run-a> <run-b> | approve <run-id> <wait-seq> yes|no [--note <text>] | wake";
 
 fn run(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<(), Box<dyn Error>> {
     let command = arguments
@@ -24,6 +24,17 @@ fn run(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<(), Bo
         None
     } else {
         Some(arguments.next().ok_or(USAGE)?)
+    };
+    let compare = if command == "diff" {
+        Some(
+            arguments
+                .next()
+                .ok_or(USAGE)?
+                .into_string()
+                .map_err(|_| USAGE)?,
+        )
+    } else {
+        None
     };
     let answer = if command == "approve" {
         let seq = arguments
@@ -84,6 +95,11 @@ fn run(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<(), Bo
     }
     let id = target.as_ref().and_then(|s| s.to_str());
     match command.as_str() {
+        "explain" => println!("{}", inspect_run(&journal, id.ok_or(USAGE)?)?),
+        "diff" => println!(
+            "{}",
+            diff_runs(&journal, id.ok_or(USAGE)?, compare.as_deref().ok_or(USAGE)?)?
+        ),
         "log" => println!("{}", journal_log(&journal, id.ok_or(USAGE)?)?),
         "replay" => {
             emit(replay_run_with_limits(
