@@ -151,12 +151,17 @@ fn instance_at(schema: &Value, value: &Value, depth: usize) -> Result<(), String
         return Err("MCP value does not match schema type".into());
     }
     if let Some(values) = schema.get("enum") {
-        if !values.as_array().unwrap().contains(value) {
+        if !values
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|expected| schema_equal(expected, value))
+        {
             return Err("MCP value not in schema enum".into());
         }
     }
     if let Some(expected) = schema.get("const") {
-        if expected != value {
+        if !schema_equal(expected, value) {
             return Err("MCP value does not match schema const".into());
         }
     }
@@ -204,6 +209,45 @@ fn instance_at(schema: &Value, value: &Value, depth: usize) -> Result<(), String
     }
     Ok(())
 }
+
+/// JSON Schema equality treats numeric spellings equally, including in containers.
+fn schema_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => match (left.is_f64(), right.is_f64()) {
+            (false, false) => left == right,
+            (true, true) => left.as_f64() == right.as_f64(),
+            (true, false) => float_equals_integer(left.as_f64().unwrap(), right),
+            (false, true) => float_equals_integer(right.as_f64().unwrap(), left),
+        },
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len() && left.iter().zip(right).all(|(a, b)| schema_equal(a, b))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| schema_equal(value, other))
+                })
+        }
+        _ => left == right,
+    }
+}
+
+fn float_equals_integer(float: f64, integer: &serde_json::Number) -> bool {
+    if float.fract() != 0.0 {
+        return false;
+    }
+    // Check exclusive upper bounds before Rust's saturating float-to-int cast.
+    // Converting the integer to f64 instead would equate distinct integers above 2^53.
+    if let Some(integer) = integer.as_i64() {
+        (i64::MIN as f64..9_223_372_036_854_775_808.0).contains(&float) && float as i64 == integer
+    } else {
+        (0.0..18_446_744_073_709_551_616.0).contains(&float)
+            && Some(float as u64) == integer.as_u64()
+    }
+}
+
 fn length(schema: &Value, length: u64, min: &str, max: &str) -> Result<(), String> {
     if schema[min].as_u64().is_some_and(|bound| length < bound)
         || schema[max].as_u64().is_some_and(|bound| length > bound)
@@ -217,6 +261,84 @@ fn length(schema: &Value, length: u64, min: &str, max: &str) -> Result<(), Strin
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn enum_and_const_use_numeric_equality_recursively() {
+        for keyword in ["enum", "const"] {
+            for (kind, expected, actual) in [
+                ("number", json!(1.0), json!(1)),
+                ("number", json!(1), json!(1.0)),
+                ("integer", json!(-0.0), json!(0)),
+                (
+                    "array",
+                    json!([1.0, {"count": -2.0}]),
+                    json!([1, {"count": -2}]),
+                ),
+                (
+                    "object",
+                    json!({"items": [1.0], "other": 2}),
+                    json!({"other": 2.0, "items": [1]}),
+                ),
+            ] {
+                let mut schema = json!({"type": kind});
+                schema[keyword] = if keyword == "enum" {
+                    json!([expected])
+                } else {
+                    expected
+                };
+                assert!(
+                    validate_instance(&schema, &actual).is_ok(),
+                    "{schema}: {actual}"
+                );
+            }
+            for (expected, actual) in [
+                (json!([1]), json!([1.5])),
+                (json!([1, 2]), json!([2, 1])),
+                (json!([1]), json!(["1"])),
+                (json!([{"count": 1}]), json!([{"other": 1}])),
+                (json!([{"count": 1}]), json!([{"count": 1, "other": 2}])),
+                (
+                    json!([9_007_199_254_740_993_u64]),
+                    json!([9_007_199_254_740_992.0]),
+                ),
+                (json!([u64::MAX]), json!([18_446_744_073_709_551_616.0])),
+                (json!([i64::MAX]), json!([9_223_372_036_854_775_808.0])),
+            ] {
+                let mut schema = json!({"type": "array"});
+                schema[keyword] = if keyword == "enum" {
+                    json!([expected])
+                } else {
+                    expected
+                };
+                assert!(
+                    validate_instance(&schema, &actual).is_err(),
+                    "{schema}: {actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_equality_preserves_exact_integer_boundaries() {
+        for (left, right) in [
+            (json!(i64::MIN), json!(-9_223_372_036_854_775_808.0)),
+            (
+                json!(9_223_372_036_854_775_808_u64),
+                json!(9_223_372_036_854_775_808.0),
+            ),
+            (
+                json!(9_007_199_254_740_993_u64),
+                json!(9_007_199_254_740_993_u64),
+            ),
+        ] {
+            assert!(schema_equal(&left, &right));
+            assert!(schema_equal(&right, &left));
+        }
+        assert!(!schema_equal(
+            &json!(9_007_199_254_740_992_u64),
+            &json!(9_007_199_254_740_993_u64)
+        ));
+    }
     #[test]
     fn validates_nested_schema_without_remote_resolution() {
         let schema = json!({"type":"object", "properties":{"count":{"type":"integer","minimum":1,"maximum":3}},"required":["count"],"additionalProperties":false});

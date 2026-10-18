@@ -46,6 +46,9 @@ properties or enum members; numeric values are limited in magnitude to
 9,007,199,254,740,991. Unsupported assertions, references, definitions, regexes,
 combinators, and external resolution are rejected. This deliberately rejects
 some otherwise valid general JSON Schema documents.
+The `enum` and `const` checks compare numeric values rather than their JSON
+spelling (`1` equals `1.0`), including inside arrays and objects. Array order
+and object property names still matter.
 
 Arguments are JSON objects bounded by the operation's 256 KiB argument limit.
 HTTP/SSE responses are capped at 1 MiB, including envelopes and stream metadata;
