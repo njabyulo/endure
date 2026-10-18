@@ -48,7 +48,8 @@ def main():
             command = [executable] if executable else ["cargo", "run", "--quiet", "--manifest-path", str(ROOT / "Cargo.toml"), "--"]
 
             def invoke(*args):
-                output = subprocess.run(command + list(args), cwd=path, text=True, capture_output=True, timeout=30)
+                options = ["--cpu-ms", "10000"] if args[0] in {"run", "replay"} else []
+                output = subprocess.run(command + list(args) + options, cwd=path, text=True, capture_output=True, timeout=30)
                 if output.returncode:
                     raise AssertionError(f"ondure {args}: {output.stdout}\n{output.stderr}")
                 return output.stdout

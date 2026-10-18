@@ -104,7 +104,8 @@ def command():
 
 
 def invoke(path, *args):
-    result = subprocess.run(command() + list(args), cwd=path, capture_output=True,
+    options = ["--cpu-ms", "10000"] if args[0] in {"run", "replay", "approve", "wake"} else []
+    result = subprocess.run(command() + list(args) + options, cwd=path, capture_output=True,
                             text=True, timeout=30)
     if result.returncode:
         raise AssertionError(f"ondure {args}: {result.returncode}\n{result.stdout}\n{result.stderr}")
@@ -141,7 +142,7 @@ def main():
                 wait_seq = db.execute("SELECT seq FROM waits WHERE run_id=? AND kind='approval'", (run_id,)).fetchone()[0]
             assert status == "parked"
             assert Receiver.model_calls == 1 and Receiver.tool_calls == 0
-            approval = subprocess.Popen(command() + ["approve", run_id, str(wait_seq), "yes", "--note", "Reviewed locally"],
+            approval = subprocess.Popen(command() + ["approve", run_id, str(wait_seq), "yes", "--note", "Reviewed locally", "--cpu-ms", "10000"],
                                         cwd=path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if not Receiver.dispatched.wait(15):
                 approval.kill()

@@ -38,3 +38,8 @@ examples. Low-level timer and TypeScript module examples remain because they
 verify supported ordinary-script behavior. Tests, local validation, remote CI,
 PR opening, merge, release, and production use are separate delivery stages;
 this document does not assert a deployment or performance result.
+
+The integrated onboarding and standard-interface fixtures explicitly use a
+10-second active execution allowance per CLI invocation so slow CI storage does
+not turn workflow correctness checks into timing benchmarks. The CLI default
+and dedicated execution-limit regression assertions remain unchanged.
