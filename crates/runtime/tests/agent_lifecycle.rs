@@ -167,3 +167,45 @@ fn relative_sleep_parks_and_reuses_recorded_deadline_after_restart() {
         1
     );
 }
+
+#[test]
+fn oversized_note_is_rejected_before_committing_an_answer() {
+    let p = Project::new("import {agent} from 'ondure'; export default agent('review', async ctx=>{ console.log((await ctx.human.approve({action:'continue'})).note); });");
+    let run = run_request(
+        &Policy::default(),
+        &p.graph(),
+        &p.journal(),
+        "request",
+        "null",
+    )
+    .unwrap();
+    let seq = Journal::open(&p.journal()).unwrap().waits(&run.id).unwrap()[0].seq;
+    let oversized = "x".repeat(runtime::MAX_OPERATION_RESULT_BYTES);
+    assert!(approve_run_with_note_and_limits(
+        &p.journal(),
+        &run.id,
+        seq,
+        true,
+        Some(&oversized),
+        RunLimits::default()
+    )
+    .is_err());
+    assert!(
+        Journal::open(&p.journal()).unwrap().waits(&run.id).unwrap()[0]
+            .answer
+            .is_none()
+    );
+    assert_eq!(
+        approve_run_with_note_and_limits(
+            &p.journal(),
+            &run.id,
+            seq,
+            true,
+            Some("accepted"),
+            RunLimits::default()
+        )
+        .unwrap()
+        .stdout,
+        "accepted\n"
+    );
+}

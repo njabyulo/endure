@@ -435,6 +435,19 @@ impl Journal {
             }
             false
         } else {
+            if answer.len() > super::operations::MAX_OPERATION_RESULT_BYTES {
+                return Err(JournalError(
+                    "journal: approval answer exceeds result limit".into(),
+                ));
+            }
+            let value: serde_json::Value = serde_json::from_str(answer)
+                .unwrap_or_else(|_| serde_json::Value::String(answer.into()));
+            super::operations::validate_json(
+                &serde_json::json!({"Ok": value}),
+                super::operations::MAX_OPERATION_RESULT_BYTES,
+                "approval answer",
+            )
+            .map_err(JournalError)?;
             transaction.execute(
                 "UPDATE waits SET answer = ?3 WHERE run_id = ?1 AND seq = ?2",
                 params![run_id, seq, answer],
