@@ -254,3 +254,142 @@ fn handler_failures_preserve_original_message_and_failed_history_on_replay() {
         assert_eq!(journal.get_run(&original.id).unwrap(), original);
     }
 }
+
+#[test]
+fn elapsed_relative_sleep_resumes_and_completed_replay_preserves_history() {
+    let p = Project::new("import {agent} from 'ondure'; export default agent('sleep',async ctx=>{ console.log('before'); await ctx.sleep('1s'); console.log('after'); });");
+    let run = run_request(
+        &Policy::default(),
+        &p.graph(),
+        &p.journal(),
+        "request",
+        "null",
+    )
+    .unwrap();
+    assert_eq!(run.status, "parked");
+    fs::remove_file(p.0.join("main.js")).unwrap();
+    let journal = Journal::open(&p.journal()).unwrap();
+    let waits = journal.waits(&run.id).unwrap();
+    let before = journal.operations(&run.id).unwrap();
+    let deadline: Result<serde_json::Value, String> = serde_json::from_str(
+        before
+            .iter()
+            .find(|op| op.name == "wait.deadline")
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(deadline.unwrap().as_i64(), waits[0].wake_at);
+    // Replaying a still-parked run must reuse the captured deadline without
+    // changing the timer's identity or committing a replacement clock value.
+    replay_run(&p.journal(), &run.id, None).unwrap();
+    assert_eq!(journal.operations(&run.id).unwrap(), before);
+    assert_eq!(journal.waits(&run.id).unwrap(), waits);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    std::thread::sleep(std::time::Duration::from_millis(
+        (waits[0].wake_at.unwrap() - now).max(0) as u64 + 30,
+    ));
+    let outcomes = wake_ready(&p.journal()).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    let completed = outcomes[0].result.as_ref().unwrap();
+    assert_eq!(completed.status, "done");
+    assert_eq!(completed.stdout, "before\nafter\n");
+    let history = journal.operations(&run.id).unwrap();
+    let completed_waits = journal.waits(&run.id).unwrap();
+    assert_eq!(
+        replay_run(&p.journal(), &run.id, None).unwrap().stdout,
+        completed.stdout
+    );
+    assert_eq!(journal.operations(&run.id).unwrap(), history);
+    assert_eq!(journal.waits(&run.id).unwrap(), completed_waits);
+}
+
+#[test]
+fn timed_approval_replays_while_parked_and_after_operator_answer() {
+    let p = Project::new("import {agent} from 'ondure'; export default agent('review',async ctx=>console.log(JSON.stringify(await ctx.human.approve({timeout:'1h'}))));");
+    let run = run_request(
+        &Policy::default(),
+        &p.graph(),
+        &p.journal(),
+        "request",
+        "null",
+    )
+    .unwrap();
+    assert_eq!(run.status, "parked");
+    fs::remove_file(p.0.join("main.js")).unwrap();
+    let journal = Journal::open(&p.journal()).unwrap();
+    let waits = journal.waits(&run.id).unwrap();
+    let before = journal.operations(&run.id).unwrap();
+    replay_run(&p.journal(), &run.id, None).unwrap();
+    assert_eq!(journal.operations(&run.id).unwrap(), before);
+    assert_eq!(journal.waits(&run.id).unwrap(), waits);
+    let output = approve_run_with_note_and_limits(
+        &p.journal(),
+        &run.id,
+        waits[0].seq,
+        true,
+        Some("approved after restart"),
+        RunLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(output.stdout.trim()).unwrap(),
+        serde_json::json!({"approved":true,"note":"approved after restart"})
+    );
+    let history = journal.operations(&run.id).unwrap();
+    let completed_waits = journal.waits(&run.id).unwrap();
+    assert_eq!(
+        replay_run(&p.journal(), &run.id, None).unwrap().stdout,
+        output.stdout
+    );
+    assert_eq!(journal.operations(&run.id).unwrap(), history);
+    assert_eq!(journal.waits(&run.id).unwrap(), completed_waits);
+}
+
+#[test]
+fn script_approval_rejects_notes_without_committing_an_answer() {
+    let p = Project::new("console.log(await ondure.approve({action:'continue'}));");
+    let run = run_request(
+        &Policy::default(),
+        &p.graph(),
+        &p.journal(),
+        "request",
+        "null",
+    )
+    .unwrap();
+    assert_eq!(run.status, "parked");
+    let journal = Journal::open(&p.journal()).unwrap();
+    let wait = journal.waits(&run.id).unwrap().remove(0);
+    let before = journal.operations(&run.id).unwrap();
+    let error = approve_run_with_note_and_limits(
+        &p.journal(),
+        &run.id,
+        wait.seq,
+        true,
+        Some("must not be lost"),
+        RunLimits::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error.message, "approval notes require an agent approval");
+    assert_eq!(journal.waits(&run.id).unwrap(), vec![wait.clone()]);
+    assert_eq!(journal.operations(&run.id).unwrap(), before);
+    assert_eq!(journal.get_run(&run.id).unwrap().status, "parked");
+    assert_eq!(
+        approve_run_with_note_and_limits(
+            &p.journal(),
+            &run.id,
+            wait.seq,
+            true,
+            None,
+            RunLimits::default()
+        )
+        .unwrap()
+        .stdout,
+        "true\n"
+    );
+}

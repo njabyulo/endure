@@ -452,7 +452,10 @@ impl Session {
             if recorded.state == "completed" {
                 let encoded = recorded.result.clone().ok_or("recorded result missing")?;
                 self.consume(seq)?;
-                return serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+                // Decode the same Result envelope written below, returning its value
+                // or recorded error rather than exposing the envelope to callers.
+                return serde_json::from_str::<Result<Value, String>>(&encoded)
+                    .map_err(|e| e.to_string())?;
             }
         }
         let result = produce();
@@ -595,6 +598,8 @@ pub fn approve_run_with_note_and_limits(
             == Some(serde_json::json!("agent-v1"));
         let value = if agent {
             serde_json::json!({"approved":answer,"note":note}).to_string()
+        } else if note.is_some() {
+            return Err("approval notes require an agent approval".into());
         } else {
             answer.to_string()
         };
