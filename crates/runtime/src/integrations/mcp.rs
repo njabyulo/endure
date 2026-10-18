@@ -1,6 +1,6 @@
 //! Bounded MCP Streamable HTTP tool adapter; no subprocess or ambient discovery.
 use super::mcp_schema::{validate_instance, validate_schema};
-use crate::core::operations::validate_json;
+use crate::core::operations::{contains_secret, validate_json};
 use crate::{
     Capabilities, HostConfig, OperationCancellation, RecoveryPolicy, MAX_OPERATION_ARGUMENT_BYTES,
     MAX_OPERATION_RESULT_BYTES,
@@ -416,16 +416,7 @@ fn read_sse(reader: impl Read, id: u64) -> Result<Value, String> {
         }
     }
 }
-fn contains_secret(value: &Value, secret: &str) -> bool {
-    match value {
-        Value::String(text) => text.contains(secret),
-        Value::Array(values) => values.iter().any(|v| contains_secret(v, secret)),
-        Value::Object(values) => values
-            .iter()
-            .any(|(key, v)| key.contains(secret) || contains_secret(v, secret)),
-        Value::Number(_) | Value::Bool(_) | Value::Null => value.to_string().contains(secret),
-    }
-}
+
 fn validate_tool_result(result: &Value) -> Result<(), String> {
     if result.get("isError").is_some_and(|v| !v.is_boolean()) {
         return Err("invalid MCP tool error flag".into());

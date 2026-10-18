@@ -588,8 +588,14 @@ fn run_on_thread(
                 .borrow()
                 .is_some()
             {
-                crate::capabilities::determinism::install(scope)
-                    .and_then(|()| crate::capabilities::agent::install(scope))
+                crate::capabilities::determinism::install(scope).and_then(|()| {
+                    if matches!(&program, Program::Module(graph) if graph.uses_agent_module()) {
+                        Ok(())
+                    } else {
+                        // Captured ordinary scripts retain their compatibility API.
+                        crate::capabilities::agent::install(scope)
+                    }
+                })
             } else {
                 Ok(())
             };

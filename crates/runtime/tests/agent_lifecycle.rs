@@ -393,3 +393,21 @@ fn script_approval_rejects_notes_without_committing_an_answer() {
         "true\n"
     );
 }
+
+#[test]
+fn new_agent_graphs_do_not_install_the_legacy_ondure_global() {
+    let p = Project::new("import {agent} from 'ondure'; console.log(typeof globalThis.ondure); export default agent('clean-context',async ctx=>{ console.log(typeof globalThis.ondure); await ctx.sleep(0); });");
+    let run = run_request(
+        &Policy::default(),
+        &p.graph(),
+        &p.journal(),
+        "request",
+        "null",
+    )
+    .unwrap();
+    assert_eq!(run.stdout, "undefined\nundefined\n");
+    assert_eq!(
+        replay_run(&p.journal(), &run.id, None).unwrap().stdout,
+        run.stdout
+    );
+}
