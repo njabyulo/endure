@@ -269,3 +269,85 @@ fn expired_ordinary_timer_records_failure_and_replays_without_running_callback()
     assert!(replay.message.contains("elapsed deadline"));
     assert!(!replay.output.stdout.contains("late"));
 }
+
+#[test]
+fn deadline_rejection_finally_cancels_visible_timer_and_replays_consistently() {
+    let f = Fixture::new(150, true);
+    let p=Project::new(&f.origin,"const timer=setTimeout(()=>console.log('unexpected timer'),10000);try{await ctx.model.call('slow')}catch(e){console.log(e.message)}finally{clearTimeout(timer)}");
+    let run = p.run(&f.config(ResourceLimits {
+        elapsed_deadline_ms: Some(30),
+        model_input_token_estimate: 10,
+        ..Default::default()
+    }));
+    assert_eq!(run.status, "done");
+    assert_eq!(run.stdout, "BudgetError: elapsed deadline exceeded\n");
+    let journal = Journal::open(&p.journal()).unwrap();
+    let ops = journal.operations(&run.id).unwrap();
+    assert_eq!(ops.iter().filter(|op| op.name == "timer.cancel").count(), 1);
+    assert_eq!(
+        ops.iter()
+            .find(|op| op.name == "timer.sleep")
+            .unwrap()
+            .result
+            .as_deref(),
+        Some("{\"canceled\":true}")
+    );
+    assert_eq!(
+        replay_run(&p.journal(), &run.id, None).unwrap().stdout,
+        run.stdout
+    );
+}
+
+#[test]
+fn late_scheduler_wake_rejects_uncommitted_wait_even_if_it_was_due_before_deadline() {
+    let p = Project::new(
+        "http://127.0.0.1:9",
+        "try{await ctx.sleep('10ms');console.log('late success')}catch(e){console.log(e.message)}",
+    );
+    let config = HostConfig {
+        resources: ResourceLimits {
+            elapsed_deadline_ms: Some(40),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let run = p.run(&config);
+    assert_eq!(run.status, "parked");
+    thread::sleep(Duration::from_millis(60));
+    let outcomes = wake_ready(&p.journal()).unwrap();
+    let done = outcomes
+        .into_iter()
+        .find(|outcome| outcome.run_id == run.id)
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(done.stdout, "BudgetError: elapsed deadline exceeded\n");
+    assert_eq!(
+        replay_run(&p.journal(), &run.id, None).unwrap().stdout,
+        done.stdout
+    );
+}
+
+#[test]
+fn previously_committed_wait_answer_replays_after_elapsed_deadline() {
+    let p = Project::new(
+        "http://127.0.0.1:9",
+        "await ctx.sleep('1h');console.log('saved answer')",
+    );
+    let config = HostConfig {
+        resources: ResourceLimits {
+            elapsed_deadline_ms: Some(40),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let run = p.run(&config);
+    let mut journal = Journal::open(&p.journal()).unwrap();
+    let wait = journal.waits(&run.id).unwrap()[0].seq;
+    journal.answer_wait(&run.id, wait, "null").unwrap();
+    thread::sleep(Duration::from_millis(60));
+    assert_eq!(
+        replay_run(&p.journal(), &run.id, None).unwrap().stdout,
+        "saved answer\n"
+    );
+}

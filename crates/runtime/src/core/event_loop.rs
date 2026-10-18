@@ -177,6 +177,22 @@ enum Completion {
     PollWaits,
 }
 
+/// A ready worker/timer may win select after the elapsed deadline is also
+/// ready. The clock is checked again at delivery, independently of select order.
+/// Historical committed outcomes bypass this live admission check.
+fn enforce_delivery_deadline(completion: Completion, expired: bool, recorded: bool) -> Completion {
+    if !expired || recorded {
+        return completion;
+    }
+    let error = "BudgetError: elapsed deadline exceeded".to_string();
+    match completion {
+        Completion::Http((id, _)) => Completion::Http((id, Err(error))),
+        Completion::Json((id, _)) => Completion::Json((id, Err(error))),
+        Completion::Timer(id) => Completion::TimerDenied(id, error),
+        other => other,
+    }
+}
+
 async fn next_completion(
     tasks: &mut JoinSet<Completion>,
     timer: Option<(OperationId, Instant)>,
@@ -216,6 +232,7 @@ pub(crate) fn run(
     let mut tasks = JoinSet::new();
     let mut immediate = VecDeque::new();
     let mut active = BTreeMap::<OperationId, bool>::new();
+    let mut deadline_timers = BTreeSet::new();
     let cancellation = OperationCancellation::default();
     let _cancellation_guard = CancellationGuard(cancellation.clone());
     loop {
@@ -307,16 +324,14 @@ pub(crate) fn run(
                 .copied()
                 .collect();
             for id in ids {
-                scope
-                    .get_slot::<HostState>()
-                    .expect("host state installed")
-                    .operations
-                    .borrow_mut()
-                    .remove_timer(id);
-                immediate.push_back(Completion::TimerDenied(
-                    id,
-                    "BudgetError: elapsed deadline exceeded".into(),
-                ));
+                // Keep the timer visible until its own completion is delivered.
+                // A preceding rejection's finally block may still cancel it.
+                if deadline_timers.insert(id) {
+                    immediate.push_back(Completion::TimerDenied(
+                        id,
+                        "BudgetError: elapsed deadline exceeded".into(),
+                    ));
+                }
             }
         }
         for (id, url) in queued {
@@ -596,7 +611,14 @@ pub(crate) fn run(
                 }
                 let completion = runtime.block_on(next_completion(&mut tasks, timer, wake));
                 super::limits::resume(scope);
-                completion
+                let expired = scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .session
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|session| session.deadline_expired());
+                enforce_delivery_deadline(completion, expired, false)
             }
         };
         if matches!(completion, Completion::PollWaits) {
@@ -727,6 +749,19 @@ pub(crate) fn run(
                 }
             }
             Completion::TimerDenied(id, error) => {
+                deadline_timers.remove(&id);
+                if !scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .operations
+                    .borrow()
+                    .timers
+                    .contains_key(&id)
+                {
+                    // A previous completion's catch/finally canceled this timer
+                    // and recorded its cancellation before this queued denial.
+                    continue;
+                }
                 if let Some(session) = scope
                     .get_slot::<HostState>()
                     .expect("host state installed")
@@ -803,4 +838,39 @@ fn complete_json(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    #[test]
+    fn late_worker_delivery_is_rejected_regardless_of_select_winner() {
+        assert!(
+            matches!(enforce_delivery_deadline(Completion::Json((1,Ok(serde_json::json!({"text":"late"})))),true,false),Completion::Json((1,Err(error))) if error.contains("elapsed deadline"))
+        );
+        assert!(
+            matches!(enforce_delivery_deadline(Completion::Http((2,Ok((200,"late".into())))),true,false),Completion::Http((2,Err(error))) if error.contains("elapsed deadline"))
+        );
+        assert!(matches!(
+            enforce_delivery_deadline(
+                Completion::Json((1, Ok(serde_json::Value::Null))),
+                false,
+                false
+            ),
+            Completion::Json((1, Ok(_)))
+        ));
+    }
+    #[test]
+    fn late_timer_is_denied_but_committed_history_keeps_its_outcome() {
+        assert!(
+            matches!(enforce_delivery_deadline(Completion::Timer(3),true,false),Completion::TimerDenied(3,error) if error.contains("elapsed deadline"))
+        );
+        assert!(matches!(
+            enforce_delivery_deadline(Completion::Timer(3), true, true),
+            Completion::Timer(3)
+        ));
+        assert!(
+            matches!(enforce_delivery_deadline(Completion::Json((1,Ok(serde_json::json!({"text":"recorded"})))),true,true),Completion::Json((1,Ok(value))) if value["text"]=="recorded")
+        );
+    }
 }

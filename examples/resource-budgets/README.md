@@ -47,7 +47,10 @@ makes a fresh reservation because the provider may charge again.
 
 The elapsed clock starts when the run record is committed and includes parked
 time. `ctx.sleep` and human approval waits can be resumed with `wake`; an expired
-wait rejects with a recorded `BudgetError`. New dispatch after the deadline is
+wait without a committed answer rejects with a recorded `BudgetError`, even if
+its wake time was earlier than the deadline and the scheduler resumed late.
+Previously committed answers and operation outcomes replay unchanged. New
+dispatch after the deadline is
 denied. In-flight adapter delivery is canceled at the deadline; late results
 cannot replace the recorded error. Cancellation cannot undo provider effects or
 charges. Ordinary timers fail the run on elapsed expiration. Checks occur at
