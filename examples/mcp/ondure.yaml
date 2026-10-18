@@ -1,0 +1,12 @@
+grants:
+  network_origins: ["http://127.0.0.1:8789"]
+  tools: ["fixture.greet"]
+mcp_servers:
+  local:
+    endpoint: "http://127.0.0.1:8789/mcp"
+    tools:
+      fixture.greet:
+        name: greet
+        retry_interrupted: false
+      fixture.denied:
+        name: greet

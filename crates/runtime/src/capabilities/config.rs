@@ -103,6 +103,8 @@ pub struct HostConfig {
     pub model: Option<crate::integrations::model::ModelConfig>,
     #[serde(skip_serializing_if = "crate::ResourceLimits::is_default")]
     pub resources: crate::ResourceLimits,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp_servers: BTreeMap<String, crate::McpServerConfig>,
 }
 fn context_limits_default(value: &crate::ContextLimits) -> bool {
     *value == crate::ContextLimits::default()
@@ -122,6 +124,15 @@ impl HostConfig {
             }
         }
         self.resources.validate()?;
+        let mut aliases = BTreeSet::new();
+        for server in self.mcp_servers.values() {
+            server.validate(self)?;
+            for alias in server.tools.keys() {
+                if !aliases.insert(alias) {
+                    return Err("duplicate configured MCP tool alias".into());
+                }
+            }
+        }
         for reference in self.credentials.values() {
             let mut bytes = reference.bytes();
             if !bytes

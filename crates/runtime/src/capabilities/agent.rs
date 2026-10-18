@@ -248,6 +248,7 @@ pub(crate) fn create_context<'s>(
     set_property(scope, context, "human", human.into());
     super::memory::install_context(scope, context)?;
     crate::integrations::model::install_context(scope, context)?;
+    crate::integrations::mcp_native::install_context(scope, context)?;
     Ok(context)
 }
 
