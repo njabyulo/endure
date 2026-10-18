@@ -227,3 +227,17 @@ receiver-idempotency and provider-mock evidence.
 Deferred work includes streaming, embeddings, model-generated compaction,
 execution forks/model overrides, local inference, stdio MCP, filesystem writes,
 real payment/email adapters, OS sandboxing and package/skill distribution.
+
+## Website
+
+The React landing page lives in `apps/website`, independently of the Rust build.
+
+```sh
+cd apps/website
+pnpm install --frozen-lockfile
+pnpm dev
+```
+
+See [the website README](apps/website/README.md) for tests and production builds.
+The interactive recovery walkthrough is a browser simulation. Website source and
+runtime examples are provided for review; no automatic deployment is performed.
