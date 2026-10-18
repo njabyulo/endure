@@ -314,8 +314,11 @@ impl Session {
                 .map_err(|e| e.to_string())?;
             Value::Null
         } else {
-            serde_json::from_str(wait.answer.as_deref().ok_or("approval answer missing")?)
-                .map_err(|e| e.to_string())?
+            let outcome = super::operations::approval_outcome(
+                wait.answer.as_deref().ok_or("approval answer missing")?,
+            )
+            .unwrap_or_else(|error| serde_json::json!({"Err":error}));
+            return Ok(Some((id, outcome)));
         };
         Ok(Some((id, serde_json::json!({"Ok": value}))))
     }

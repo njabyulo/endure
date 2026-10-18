@@ -74,6 +74,18 @@ pub(crate) fn validate_json(value: &Value, limit: usize, kind: &str) -> Result<(
     Ok(())
 }
 
+/// Bound both stored approval input and its eventual completion envelope.
+pub(crate) fn approval_outcome(answer: &str) -> Result<Value, String> {
+    if answer.len() > MAX_OPERATION_RESULT_BYTES {
+        return Err("approval answer exceeds result limit".into());
+    }
+    let value: Value =
+        serde_json::from_str(answer).map_err(|_| "approval answer must be valid JSON")?;
+    let outcome = serde_json::json!({"Ok":value});
+    validate_json(&outcome, MAX_OPERATION_RESULT_BYTES, "result")?;
+    Ok(outcome)
+}
+
 /// Cooperative adapter cancellation. Cancellation cannot undo external effects.
 #[derive(Clone, Default)]
 pub struct OperationCancellation(Arc<AtomicBool>);

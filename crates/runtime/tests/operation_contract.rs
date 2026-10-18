@@ -132,3 +132,59 @@ fn historical_completed_responses_are_not_subject_to_new_size_limits() {
     assert_eq!(replay_run(&project.journal(), "run", None).unwrap(), first);
     assert_eq!(witness.finish(), 1);
 }
+
+#[test]
+fn approval_answers_are_bounded_before_commit_and_invalid_legacy_answers_finish_as_errors() {
+    let project = Project::new("console.log(await ondure.approve({action:'continue'}));");
+    project.run().unwrap();
+    let mut journal = Journal::open(&project.journal()).unwrap();
+    let wait = journal.waits("run").unwrap().remove(0);
+    let oversized = serde_json::to_string(&"x".repeat(MAX_OPERATION_RESULT_BYTES - 8)).unwrap();
+    assert!(oversized.len() <= MAX_OPERATION_RESULT_BYTES);
+    let decoded: serde_json::Value = serde_json::from_str(&oversized).unwrap();
+    assert!(
+        serde_json::to_vec(&serde_json::json!({"Ok":decoded}))
+            .unwrap()
+            .len()
+            > MAX_OPERATION_RESULT_BYTES
+    );
+    for answer in [oversized.as_str(), "not-json"] {
+        assert!(journal.answer_wait("run", wait.seq, answer).is_err());
+        assert!(journal.waits("run").unwrap()[0].answer.is_none());
+    }
+    assert!(journal.answer_wait("run", wait.seq, "true").unwrap());
+    assert_eq!(
+        replay_run(&project.journal(), "run", None).unwrap().stdout,
+        "true\n"
+    );
+
+    for answer in [oversized, "not-json".to_string()] {
+        let project = Project::new("console.log(await ondure.approve({action:'legacy'}));");
+        project.run().unwrap();
+        // Simulate data committed through the former unvalidated journal API.
+        let db = rusqlite::Connection::open(project.journal()).unwrap();
+        db.execute("UPDATE waits SET answer=?1 WHERE run_id='run'", [&answer])
+            .unwrap();
+        drop(db);
+        let failure = replay_run(&project.journal(), "run", None).unwrap_err();
+        assert!(
+            failure.message.contains("result exceed") || failure.message.contains("valid JSON")
+        );
+        let journal = Journal::open(&project.journal()).unwrap();
+        let operation = journal.operations("run").unwrap().remove(0);
+        assert_eq!(operation.state, "completed");
+        let outcome = operation.result.unwrap();
+        assert!(outcome.len() < 256);
+        assert!(
+            serde_json::from_str::<Result<serde_json::Value, String>>(&outcome)
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(
+            replay_run(&project.journal(), "run", None)
+                .unwrap_err()
+                .message,
+            failure.message
+        );
+    }
+}

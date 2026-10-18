@@ -408,6 +408,7 @@ impl Journal {
     }
 
     /// Record the first answer. Repeating it is harmless; replacing it is rejected.
+    /// Approval answers must be JSON whose completion envelope fits the result limit.
     pub fn answer_wait(
         &mut self,
         run_id: &str,
@@ -418,11 +419,14 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let seq = sequence(seq)?;
-        let existing: Option<String> = transaction.query_row(
-            "SELECT answer FROM waits WHERE run_id = ?1 AND seq = ?2",
+        let (kind, existing): (String, Option<String>) = transaction.query_row(
+            "SELECT kind,answer FROM waits WHERE run_id = ?1 AND seq = ?2",
             params![run_id, seq],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        if kind == "approval" {
+            super::operations::approval_outcome(answer).map_err(JournalError)?;
+        }
         let changed = if let Some(existing) = existing {
             if existing != answer {
                 return Err(JournalError(format!(
@@ -879,14 +883,14 @@ mod tests {
                 .unwrap();
             assert_eq!(journal.get_run("run").unwrap().status, "running");
             journal.finish_run("run", "parked", "", "").unwrap();
-            assert!(journal.answer_wait("run", 0, "yes").unwrap());
+            assert!(journal.answer_wait("run", 0, "true").unwrap());
         }
         let mut journal = Journal::open(&path).unwrap();
-        assert!(!journal.answer_wait("run", 0, "yes").unwrap());
-        assert!(journal.answer_wait("run", 0, "no").is_err());
+        assert!(!journal.answer_wait("run", 0, "true").unwrap());
+        assert!(journal.answer_wait("run", 0, "false").is_err());
         let waits = journal.waits("run").unwrap();
         assert_eq!(waits.len(), 2);
-        assert_eq!(waits[0].answer.as_deref(), Some("yes"));
+        assert_eq!(waits[0].answer.as_deref(), Some("true"));
         assert_eq!(waits[0].details, "send email");
         assert!(journal
             .park_wait("run", 0, "approval", None, "delete file")
