@@ -1,8 +1,12 @@
 //! SQLite conversation context, lexical retrieval, and versioned shared state.
 //! All reads and writes execute inside the operation-outcome transaction.
+use crate::MAX_OPERATION_RESULT_BYTES;
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+const MAX_CONTEXT_MESSAGES: usize = 10_000;
+const MAX_CONTEXT_BYTES: usize = MAX_OPERATION_RESULT_BYTES / 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -25,6 +29,13 @@ impl ContextLimits {
     pub fn validate(&self) -> Result<(), String> {
         if self.max_messages == 0 || self.max_bytes == 0 || self.recent_messages == 0 {
             return Err("context limits must be positive".into());
+        }
+        // Bytes count serialized messages. The remaining half of the outcome
+        // limit covers array separators, the result envelope and archive count.
+        // Even 10,000 maximal SQLite i64 archive IDs encode below 210 KiB;
+        // those are stored separately from the returned context.
+        if self.max_messages > MAX_CONTEXT_MESSAGES || self.max_bytes > MAX_CONTEXT_BYTES {
+            return Err(format!("context limits cannot exceed {MAX_CONTEXT_MESSAGES} messages or {MAX_CONTEXT_BYTES} bytes"));
         }
         if self.recent_messages > self.max_messages {
             return Err("recent_messages cannot exceed max_messages".into());
@@ -278,6 +289,51 @@ mod tests {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+    #[test]
+    fn maximum_accepted_context_and_compaction_results_fit_encoded_outcome_limit() {
+        let limits = ContextLimits {
+            max_messages: MAX_CONTEXT_MESSAGES,
+            max_bytes: MAX_CONTEXT_BYTES,
+            recent_messages: 1,
+        };
+        limits.validate().unwrap();
+        let mut t = Test::new();
+        let content = "x".repeat((MAX_CONTEXT_BYTES - 128) / 3);
+        let mut result = Value::Null;
+        for _ in 0..3 {
+            result = t
+                .op(
+                    "context.add",
+                    json!({"message":{"role":"user","content":content}}),
+                    limits,
+                )
+                .unwrap();
+        }
+        let encoded = json!({"Ok":result}).to_string().len();
+        assert!(encoded > MAX_CONTEXT_BYTES - 256);
+        assert!(encoded < MAX_OPERATION_RESULT_BYTES);
+        let messages = t.op("context.messages", json!({}), limits).unwrap();
+        assert_eq!(messages.as_array().unwrap().len(), 3);
+        assert!(json!({"Ok":messages}).to_string().len() < MAX_OPERATION_RESULT_BYTES);
+        let compacted = t
+            .op(
+                "context.add",
+                json!({"message":{"role":"user","content":"y".repeat(512)}}),
+                limits,
+            )
+            .unwrap();
+        assert_eq!(compacted["archived"], 1);
+        assert!(json!({"Ok":compacted}).to_string().len() < MAX_OPERATION_RESULT_BYTES);
+        // Account for the maximum separator/envelope and persisted ID overhead.
+        const { assert!(MAX_CONTEXT_BYTES + MAX_CONTEXT_MESSAGES + 128 < MAX_OPERATION_RESULT_BYTES) };
+        assert!(
+            serde_json::to_vec(&vec![i64::MAX; MAX_CONTEXT_MESSAGES])
+                .unwrap()
+                .len()
+                < MAX_OPERATION_RESULT_BYTES / 2
+        );
+    }
+
     #[test]
     fn session_replay_reuses_state_outcomes_without_incrementing_versions() {
         use crate::{core::durability::Session, ModuleGraph, Policy};

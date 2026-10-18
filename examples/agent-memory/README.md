@@ -18,8 +18,12 @@ compaction archives the oldest eligible messages, preserving all system messages
 and the most recent 16 messages. Oversized protected context is rejected and its
 mutation is rolled back. Compaction decisions and removed messages remain in
 SQLite. Configure these limits with trusted `context_limits` in `ondure.yaml`
-(`max_messages`, `max_bytes`, `recent_messages`). All must be positive, and
-`recent_messages` cannot exceed `max_messages`. This is deterministic removal,
+(`max_messages`, `max_bytes`, `recent_messages`). All must be positive;
+`max_messages` cannot exceed 10,000, `max_bytes` cannot exceed 524,288 (512 KiB),
+and `recent_messages` cannot exceed `max_messages`. The byte limit counts encoded
+message objects. These bounds leave room for array separators, archive counts,
+and the outcome envelope under the shared 1 MiB result cap; archived message IDs
+are persisted separately. This is deterministic removal,
 without model-generated summaries.
 
 `remember(text, {scope, metadata})` stores lexical facts; `recall(query,

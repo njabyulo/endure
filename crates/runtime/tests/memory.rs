@@ -134,6 +134,19 @@ fn context_configuration_rejects_invalid_limits() {
     assert!(
         HostConfig::from_yaml("context_limits: {max_messages: 3, recent_messages: 4}").is_err()
     );
+    for invalid in [
+        "context_limits: {max_bytes: 2097152}",
+        "context_limits: {max_bytes: 524289}",
+        "context_limits: {max_messages: 10001}",
+    ] {
+        assert!(
+            HostConfig::from_yaml(invalid).is_err(),
+            "accepted {invalid}"
+        );
+    }
+    assert!(
+        HostConfig::from_yaml("context_limits: {max_messages: 10000, max_bytes: 524288}").is_ok()
+    );
     let config = HostConfig::from_yaml("context_limits: {max_messages: 64}").unwrap();
     assert_eq!(config.context_limits.max_bytes, 256 * 1024);
 }
