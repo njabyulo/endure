@@ -99,6 +99,14 @@ impl ModuleGraph {
             },
         );
         for specifier in prepared.imports {
+            if specifier == "ondure" {
+                self.modules
+                    .get_mut(&id)
+                    .expect("prepared module")
+                    .imports
+                    .insert(specifier, "ondure".into());
+                continue;
+            }
             if !(specifier.starts_with("./") || specifier.starts_with("../"))
                 || specifier.contains(['\\', '?', '#'])
             {
@@ -135,7 +143,7 @@ impl ModuleGraph {
                 module
                     .imports
                     .values()
-                    .any(|id| !self.modules.contains_key(id))
+                    .any(|id| id != "ondure" && !self.modules.contains_key(id))
             })
             || self.compute_hash() != self.hash
         {
@@ -145,6 +153,12 @@ impl ModuleGraph {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn uses_agent_module(&self) -> bool {
+        self.modules
+            .values()
+            .any(|m| m.imports.values().any(|id| id == "ondure"))
     }
 
     fn compute_hash(&self) -> String {
@@ -211,6 +225,19 @@ pub(crate) fn evaluate(
             .ok_or("compiled module has no script ID")?;
         store.edges.insert(script_id, module.imports.clone());
     }
+    if graph.uses_agent_module() {
+        let name = v8::String::new(scope, "ondure").ok_or("builtin module name")?;
+        let export = v8::String::new(scope, "agent").ok_or("builtin export")?;
+        let builtin = v8::Module::create_synthetic_module(
+            scope,
+            name,
+            &[export],
+            crate::capabilities::agent::evaluate_builtin,
+        );
+        store
+            .compiled
+            .insert("ondure".into(), v8::Global::new(scope, builtin));
+    }
     let entry = v8::Local::new(scope, &store.compiled[&graph.entry]);
     scope.set_slot(store);
     if entry.instantiate_module(scope, resolve) != Some(true) {
@@ -219,6 +246,18 @@ pub(crate) fn evaluate(
     let value = entry.evaluate(scope).ok_or("module evaluation failed")?;
     let promise = v8::Local::<v8::Promise>::try_from(value)
         .map_err(|_| "module evaluation did not return a promise")?;
+    let promise = if graph.uses_agent_module() {
+        let namespace = entry.get_module_namespace();
+        let invoke = v8::Function::builder(crate::capabilities::agent::invoke_default)
+            .data(namespace)
+            .build(scope)
+            .ok_or("agent invocation callback")?;
+        promise
+            .then(scope, invoke)
+            .ok_or("agent invocation continuation")?
+    } else {
+        promise
+    };
     // A real rejection handler clears an already-reported rejection and marks
     // future rejection handled. The event loop observes the original promise between completions.
     let handler = v8::Function::new(

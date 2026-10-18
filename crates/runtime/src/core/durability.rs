@@ -346,10 +346,20 @@ impl Session {
                 .map_err(|e| e.to_string())?;
             Value::Null
         } else {
-            let outcome = super::operations::approval_outcome(
-                wait.answer.as_deref().ok_or("approval answer missing")?,
-            )
-            .unwrap_or_else(|error| serde_json::json!({"Err":error}));
+            let answer = if let Some(answer) = &wait.answer {
+                answer.clone()
+            } else {
+                self.journal
+                    .timeout_wait(
+                        &self.run_id,
+                        wait.seq,
+                        r#"{"approved":false,"note":"Approval timed out"}"#,
+                        now,
+                    )
+                    .map_err(|e| e.to_string())?
+            };
+            let outcome = super::operations::approval_outcome(&answer)
+                .unwrap_or_else(|error| serde_json::json!({"Err":error}));
             return Ok(Some((id, outcome)));
         };
         Ok(Some((id, serde_json::json!({"Ok": value}))))
@@ -442,7 +452,10 @@ impl Session {
             if recorded.state == "completed" {
                 let encoded = recorded.result.clone().ok_or("recorded result missing")?;
                 self.consume(seq)?;
-                return serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+                // Decode the same Result envelope written below, returning its value
+                // or recorded error rather than exposing the envelope to callers.
+                return serde_json::from_str::<Result<Value, String>>(&encoded)
+                    .map_err(|e| e.to_string())?;
             }
         }
         let result = produce();
@@ -555,6 +568,18 @@ pub fn approve_run_with_limits(
     answer: bool,
     limits: super::limits::RunLimits,
 ) -> Result<RunOutput, crate::HostError> {
+    approve_run_with_note_and_limits(path, run_id, seq, answer, None, limits)
+}
+
+/// Answer as the trusted local operator; recipient labels are descriptive only.
+pub fn approve_run_with_note_and_limits(
+    path: &Path,
+    run_id: &str,
+    seq: u64,
+    answer: bool,
+    note: Option<&str>,
+    limits: super::limits::RunLimits,
+) -> Result<RunOutput, crate::HostError> {
     let record_answer = || -> Result<(), String> {
         let _lease = RunLease::acquire(path, &format!("run:{run_id}"))?;
         let mut journal = Journal::open(path).map_err(|e| e.to_string())?;
@@ -567,8 +592,19 @@ pub fn approve_run_with_limits(
         if wait.kind != "approval" {
             return Err("wait is not an approval".into());
         }
+        let agent = serde_json::from_str::<Value>(&wait.details)
+            .ok()
+            .and_then(|v| v.get("resultFormat").cloned())
+            == Some(serde_json::json!("agent-v1"));
+        let value = if agent {
+            serde_json::json!({"approved":answer,"note":note}).to_string()
+        } else if note.is_some() {
+            return Err("approval notes require an agent approval".into());
+        } else {
+            answer.to_string()
+        };
         journal
-            .answer_wait(run_id, seq, if answer { "true" } else { "false" })
+            .answer_wait(run_id, seq, &value)
             .map_err(|e| e.to_string())?;
         Ok(())
     };

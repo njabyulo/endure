@@ -24,7 +24,6 @@ pub(crate) struct HostState {
 
 impl HostState {
     /// Called once by the agent entrypoint before invoking its handler.
-    #[allow(dead_code)] // The agent lifecycle layer consumes this boundary.
     pub(crate) fn request_capabilities(&self, requested: &Capabilities) -> Result<(), String> {
         requested.validate()?;
         let grants = self
@@ -485,7 +484,13 @@ fn run_on_thread(
     isolate.set_host_import_module_dynamically_callback(modules::reject_dynamic_import);
     isolate.set_slot(HostState {
         policy: *policy,
-        effective_capabilities: RefCell::new(config.as_ref().map(|c| c.grants.clone())),
+        effective_capabilities: RefCell::new(
+            if matches!(&program, Program::Module(graph) if graph.uses_agent_module()) {
+                Some(Capabilities::default())
+            } else {
+                config.as_ref().map(|c| c.grants.clone())
+            },
+        ),
         host_config: config,
         stdout: RefCell::new(String::new()),
         stderr: RefCell::new(String::new()),
@@ -546,6 +551,7 @@ fn run_on_thread(
 
     // Drop all module handles while their isolate is still alive.
     isolate.remove_slot::<modules::ModuleStore>();
+    crate::capabilities::agent::dispose(&mut isolate);
     let state = isolate
         .remove_slot::<HostState>()
         .expect("host state installed");
