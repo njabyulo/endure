@@ -9,6 +9,7 @@ pub fn inspect_run(path: &Path, run_id: &str) -> Result<Value, String> {
     let journal = Journal::open(path).map_err(|e| e.to_string())?;
     let run = journal.get_run(run_id).map_err(|e| e.to_string())?;
     let snapshot: Value = serde_json::from_str(&run.graph).map_err(|e| e.to_string())?;
+    let resources = journal.resource_report(run_id)?;
     let operations = journal.operations(run_id).map_err(|e| e.to_string())?;
     let attempts = journal.attempts(run_id).map_err(|e| e.to_string())?;
     let waits = journal.waits(run_id).map_err(|e| e.to_string())?;
@@ -17,7 +18,7 @@ pub fn inspect_run(path: &Path, run_id: &str) -> Result<Value, String> {
         "code_hash": run.code_hash, "input": snapshot.get("input"),
         "permissions": { "legacy_net": snapshot.get("net"),
             "grants": snapshot.pointer("/host_config/grants") },
-        "operations": operations, "attempts": attempts, "waits": waits,
+        "resources": resources, "operations": operations, "attempts": attempts, "waits": waits,
         "stdout": run.stdout, "stderr": run.stderr,
     }))
 }
