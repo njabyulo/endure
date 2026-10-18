@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { FeatureExamples } from "./FeatureExamples";
 import { featureExamples } from "./feature-data";
 import { AgentContext } from "./AgentContext";
+import { WorkflowIllustration } from "./WorkflowIllustration";
+import { MemoryStory } from "./MemoryStory";
 import { RecoveryWalkthrough } from "./RecoveryWalkthrough";
 import { RuntimeArchitecture } from "./RuntimeArchitecture";
 import { Icon, Mark } from "./Icons";
@@ -37,10 +39,16 @@ function Header() {
         id="navigation"
         aria-label="Main navigation"
       >
-        <a ref={firstNavigationLink} href="#runtime" onClick={() => setOpen(false)}>
+        <a
+          ref={firstNavigationLink}
+          href="#runtime"
+          onClick={() => setOpen(false)}
+        >
           Runtime
         </a>
-        <a href="#features" onClick={() => setOpen(false)}>Features</a>
+        <a href="#features" onClick={() => setOpen(false)}>
+          Features
+        </a>
         <a href="#recovery" onClick={() => setOpen(false)}>
           Recovery
         </a>
@@ -120,174 +128,250 @@ function App() {
         Skip to content
       </a>
       <div className="page-shell">
-        <Header />
-        <main id="main">
-          <section className="hero" aria-labelledby="hero-title">
-            <div className="eyebrow hero-eyebrow">
-              <span className="status-dot" />
-              THE DURABLE AI RUNTIME
-            </div>
-            <h1 id="hero-title">
-              Autonomous agents fail. <br />
-              Ondure makes them <em>durable.</em>
-            </h1>
-            <p className="hero-description">
-              Ondure is a Rust-built JavaScript and TypeScript runtime
-              <br className="desktop-break" /> for long-running agents. It combines V8 execution,
-              <br className="desktop-break" /> host-enforced permissions, and a durable operation history.
-            </p>
-            <div className="hero-actions">
-              <a className="button button-primary" href="#get-started">
-                Get started <Icon name="arrow" size={15} />
-              </a>
-              <a className="button button-secondary" href="#recovery">
-                <span className="play-circle">
-                  <Icon name="play" size={9} />
-                </span>
-                See recovery in action
-              </a>
-            </div>
-            <div className="hero-proof">
-              <span className="isolate-stack" aria-hidden="true">
-                <Mark />
-                <Mark />
-                <Mark />
+        <div className="sky-cap">
+          <Header />
+        </div>
+        <main id="main" aria-label="Explore Ondure">
+          <div className="sky-opening">
+            <section className="hero" aria-labelledby="hero-title">
+              <span className="eyebrow hero-eyebrow">
+                A DURABLE RUNTIME FOR AGENTS
               </span>
-              <span>
-                <span className="status-dot" />
-                RECORD PROGRESS. CONTROL ACCESS. RECOVER.
-              </span>
-            </div>
-          </section>
-          <AgentContext />
-          <section className="technology" aria-label="Technology foundation">
-            <p>
-              V8 runs the code. <span>Rust enforces the boundary. SQLite keeps the history.</span>
-            </p>
-            <div className="technology-logos">
-              <span className="tech-rust">
-                <span className="rust-gear">R</span> Rust
-              </span>
-              <span className="tech-v8">
-                <span className="v8-mark">V8</span>
-              </span>
-              <span className="tech-tokio">
-                <span className="tokio-symbol">◌</span> tokio
-              </span>
-              <span className="tech-sqlite">
-                <span className="sqlite-symbol">▱</span> SQLite{" "}
-                <small>WAL</small>
-              </span>
-              <span className="tech-typescript">
-                <span className="ts-symbol">TS</span> TypeScript{" "}
-                <small>via SWC</small>
-              </span>
-            </div>
-          </section>
-          <RuntimeArchitecture />
-          <RecoveryWalkthrough />
-          <FeatureExamples examples={featureExamples} />
-          <section className="direction content-inset" aria-labelledby="direction-title">
-            <div className="section-heading"><div><span className="eyebrow">FUTURE / OUTSIDE THIS VERSION</span><h2 id="direction-title">A bounded foundation.<br /><em>Room to grow.</em></h2></div><p>Streaming inference, embeddings, model-generated summaries, execution forks, local inference, OS sandboxing and package registries remain future work.</p></div>
-          </section>
-          <section
-            className="guarantees content-inset"
-            aria-labelledby="guarantees-title"
-          >
-            <div className="section-heading">
-              <div>
-                <span className="eyebrow">05 / GUARANTEES AND LIMITS</span>
-                <h2 id="guarantees-title">Know what <em>survives.</em></h2>
-              </div>
-              <p>Recovery starts with a clear record of what completed—and what is still uncertain.</p>
-            </div>
-            <div className="guarantee-grid">
-              <div>
-                <span className="eyebrow">01 / COMPLETED OPERATIONS</span>
-                <h3>Use the result you already have.</h3>
-                <p>A completed model or tool operation returns its committed outcome during replay. The runtime does not send that operation again.</p>
-              </div>
-              <div>
-                <span className="eyebrow">02 / INTERRUPTED REQUESTS</span>
-                <h3>Make retries explicit.</h3>
-                <p>An intent records a request, not proof of its external outcome. Unsafe interrupted operations stop for reconciliation; explicitly retryable requests may run again and incur costs.</p>
-              </div>
-              <div>
-                <span className="eyebrow">03 / EXTERNAL EFFECTS</span>
-                <h3>Respect the outside world.</h3>
-                <p>A local journal cannot undo an external action or guarantee exactly-once effects. Those guarantees need cooperation from the receiving service.</p>
-              </div>
-              <div>
-                <span className="eyebrow">04 / EXECUTION HISTORY</span>
-                <h3>Rebuild from the record.</h3>
-                <p>Ondure verifies captured code and replays supported recorded operations in a fresh isolate. Recovery uses history, not a saved JavaScript heap.</p>
-              </div>
-            </div>
-            <p className="guarantees-footnote">Process-crash tests do not establish hardware power-loss behavior. Persistence depends on storage honoring synchronization requests. Dollar reservations use configured estimates and prices, not an exact provider billing cap.</p>
-          </section>
-          <section
-            className="get-started content-inset"
-            id="get-started"
-            aria-labelledby="start-title"
-          >
-            <div>
-              <span className="eyebrow">
-                <span className="status-dot" />
-                06 / TRY ONDURE · BUILD FROM SOURCE
-              </span>
-              <h2 id="start-title">
-                Start with a run.
+              <h1 id="hero-title">
+                Big ideas.
                 <br />
-                <em>Keep its history.</em>
-              </h2>
-              <p>
-                Build the CLI and try a local model fixture.
-                <br />
-                No provider credentials or paid calls are required.
+                Agents that <em>keep going.</em>
+              </h1>
+              <p className="hero-description">
+                A little interruption shouldn’t end a good workflow.
+                <br className="desktop-break" /> Run JavaScript and TypeScript
+                agents with a history to come back to.
               </p>
+              <div className="hero-actions">
+                <a className="button button-primary" href="#get-started">
+                  Get started <Icon name="arrow" size={15} />
+                </a>
+                <a className="hero-watch" href="#recovery">
+                  <Icon name="play" size={12} /> See how recovery works
+                </a>
+              </div>
+              <WorkflowIllustration />
+            </section>
+          </div>
+          <div className="page-content">
+            <AgentContext />
+            <RecoveryWalkthrough />
+            <section className="technology" aria-label="Technology foundation">
+              <p>Thoughtfully built on familiar foundations.</p>
+              <div className="technology-logos">
+                <span>
+                  <b className="tech-symbol rust-symbol">R</b>Rust
+                </span>
+                <span>
+                  <b className="tech-symbol v8-symbol">V8</b>V8
+                </span>
+                <span>
+                  <b className="tech-symbol sqlite-symbol">▱</b>SQLite
+                </span>
+                <span>
+                  <b className="tech-symbol ts-symbol">TS</b>TypeScript
+                </span>
+              </div>
+              <p className="technology-note">
+                V8 runs the code. Rust enforces the boundary. SQLite keeps the
+                history.
+              </p>
+            </section>
+            <MemoryStory />
+            <div className="editorial-pause">
+              <span className="little-star" aria-hidden="true">
+                ✳
+              </span>
+              <p>
+                The next big step?
+                <br />
+                <em>Knowing where you left off.</em>
+              </p>
+              <span>Recorded operations give recovery a place to start.</span>
+            </div>
+            <RuntimeArchitecture />
+            <FeatureExamples examples={featureExamples} />
+            <section
+              className="guarantees content-inset"
+              aria-labelledby="guarantees-title"
+            >
+              <div className="section-heading centered">
+                <span className="eyebrow">A CLEARER PICTURE</span>
+                <h2 id="guarantees-title">
+                  Know what <em>survives.</em>
+                </h2>
+                <p>
+                  A durable workflow starts with a clear record of what
+                  completed
+                  <br className="desktop-break" /> and what is still uncertain.
+                </p>
+              </div>
+              <div className="guarantee-grid">
+                <article>
+                  <span className="number-disc">01</span>
+                  <h3>Keep completed results.</h3>
+                  <p>
+                    A committed model or tool outcome is reused on replay. That
+                    recorded operation isn’t sent again.
+                  </p>
+                </article>
+                <article>
+                  <span className="number-disc">02</span>
+                  <h3>Make retries explicit.</h3>
+                  <p>
+                    An intent isn’t proof of an external outcome. Unsafe
+                    interrupted operations stop for reconciliation; retryable
+                    requests may run again and incur costs.
+                  </p>
+                </article>
+                <article>
+                  <span className="number-disc">03</span>
+                  <h3>Rebuild from history.</h3>
+                  <p>
+                    Captured code and supported operations replay in a fresh
+                    isolate. Recovery uses the journal, not a saved JavaScript
+                    heap.
+                  </p>
+                </article>
+              </div>
+              <p className="guarantees-footnote">
+                External effects require cooperation from the receiver; a local
+                journal does not guarantee exactly-once effects. Process-crash
+                tests do not establish hardware power-loss behavior. Dollar
+                accounting uses configured estimates and prices, not an exact
+                provider billing cap.
+              </p>
+            </section>
+            <section
+              className="get-started content-inset"
+              id="get-started"
+              aria-labelledby="start-title"
+            >
+              <div className="section-heading centered">
+                <span className="eyebrow">MAKE YOURSELF AT HOME</span>
+                <h2 id="start-title">Your first durable run.</h2>
+                <p>
+                  Build from source. Try a local fixture.
+                  <br />
+                  No provider credentials or paid calls required.
+                </p>
+              </div>
+              <div className="getting-started-examples">
+                <CopyInstall />
+                <div className="approval-example">
+                  <div className="code-heading">
+                    <span>HUMAN IN THE LOOP</span>
+                    <span>JAVASCRIPT</span>
+                  </div>
+                  <pre tabIndex={0} aria-label="Durable approval example">
+                    <HighlightedCode code={APPROVAL} />
+                  </pre>
+                  <p>
+                    An approval can stay pending across process restarts. A
+                    trusted local operator answers through the CLI.
+                  </p>
+                  <a
+                    className="text-link"
+                    href={`${GITHUB}/blob/feat/agent-runtime-website/examples/agent-lifecycle/README.md`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Approval and recovery commands{" "}
+                    <Icon name="arrow" size={15} />
+                  </a>
+                </div>
+              </div>
+            </section>
+            <section
+              className="closing content-inset"
+              aria-labelledby="closing-title"
+            >
+              <span className="closing-doodle" aria-hidden="true">
+                ↗
+              </span>
+              <span className="eyebrow">GOOD IDEAS DESERVE A CONTINUATION</span>
+              <h2 id="closing-title">
+                <em>Let’s keep going.</em>
+              </h2>
+              <p>Give your next agent a history to build on.</p>
               <a
-                className="text-link"
+                className="button button-primary"
                 href={GITHUB}
                 target="_blank"
                 rel="noreferrer"
               >
                 Explore Ondure on GitHub <Icon name="arrow" size={15} />
               </a>
-            </div>
-            <div className="getting-started-examples">
-              <CopyInstall />
-              <div className="approval-example">
-                <div className="code-heading"><span>examples/agent-lifecycle/main.ts</span><span>SUPPORTED TODAY</span></div>
-                <pre tabIndex={0} aria-label="Durable approval example"><HighlightedCode code={APPROVAL} /></pre>
-                <p>A pending approval is persisted. Once other live work finishes, the isolate is released. Answer with the CLI to reconstruct the run and continue.</p>
-                <a className="text-link" href={`${GITHUB}/blob/feat/agent-runtime-website/examples/agent-lifecycle/README.md`} target="_blank" rel="noreferrer">Approval and recovery commands <Icon name="arrow" size={15} /></a>
-              </div>
-            </div>
-          </section>
+              <a className="closing-secondary" href="#features">
+                Find your first example
+              </a>
+            </section>
+            <aside className="future-note content-inset">
+              <span className="eyebrow">MORE TO EXPLORE, LATER</span>
+              <p>
+                Streaming inference, embeddings, model-generated summaries,
+                forks, local inference, OS sandboxing and package registries
+                remain future work.
+              </p>
+            </aside>
+          </div>
         </main>
-        <footer className="footer content-inset">
-          <a className="wordmark" href="#" aria-label="Ondure home">
-            <Mark />
-            <span>ondure</span>
-          </a>
-          <p>Source build · feature-series review branch.</p>
-          <div>
-            <a href={`${GITHUB}/blob/feat/agent-runtime-website/README.md`} target="_blank" rel="noreferrer">
-              Documentation ↗
+        <footer className="footer">
+          <div className="footer-top">
+            <a className="wordmark" href="#" aria-label="Ondure home">
+              <Mark />
+              <span>ondure</span>
             </a>
-            <a
-              href={`${GITHUB}/blob/feat/agent-runtime-website/LICENSE`}
-              target="_blank"
-              rel="noreferrer"
-            >
-              MIT license ↗
-            </a>
+            <p>Big ideas. A history to come back to.</p>
+          </div>
+          <div className="footer-links">
+            <div>
+              <span>EXPLORE</span>
+              <a href="#runtime">How it works</a>
+              <a href="#recovery">Recovery walkthrough</a>
+              <a href="#features">Runnable examples</a>
+            </div>
+            <div>
+              <span>BUILD</span>
+              <a
+                href={`${GITHUB}/blob/feat/agent-runtime-website/README.md`}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Documentation ↗
+              </a>
+              <a href={GITHUB} target="_blank" rel="noreferrer">
+                GitHub ↗
+              </a>
+              <a
+                href={`${GITHUB}/blob/feat/agent-runtime-website/LICENSE`}
+                target="_blank"
+                rel="noreferrer"
+              >
+                MIT license ↗
+              </a>
+            </div>
+            <div className="footer-colophon">
+              <span>BUILT WITH INTENTION</span>
+              <p>
+                JavaScript & TypeScript.
+                <br />
+                V8 + Rust + SQLite.
+              </p>
+              <p>Source build · feature-series review branch.</p>
+            </div>
+          </div>
+          <div className="footer-bottom">
+            <span>© 2026 Ondure</span>
+            <span>For the work worth continuing.</span>
+            <a href="#">Back to top ↑</a>
           </div>
         </footer>
-      </div>
-      <div className="outside-footer">
-        <span>JAVASCRIPT & TYPESCRIPT. V8 + RUST + SQLITE.</span>
-        <span>ONDURE / 2026</span>
       </div>
     </>
   );

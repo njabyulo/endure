@@ -1,19 +1,19 @@
 :root {
   font-family: "IBM Plex Sans", sans-serif;
-  color: #233023;
-  background: #f4f3e8;
+  color: #272b26;
+  background: #fdfbf8;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   color-scheme: light;
-  --bg: #f4f3e8;
-  --panel: #f4f3e8;
-  --text: #233023;
-  --muted: #646d59;
-  --green: #304b32;
-  --amber: #94681f;
-  --line: #d1d3c2;
+  --bg: #fdfbf8;
+  --panel: #fdfbf8;
+  --text: #272b26;
+  --muted: #62665c;
+  --green: #355e44;
+  --amber: #80561a;
+  --line: #e0e0d6;
   --mono: "IBM Plex Mono", monospace;
   --serif: "Instrument Serif", Georgia, serif;
 }
@@ -74,8 +74,8 @@ code {
   font-family: inherit;
 }
 ::selection {
-  background: #d6dfc8;
-  color: #233023;
+  background: #ffe99a;
+  color: #272b26;
 }
 .sr-only {
   position: absolute;
@@ -93,7 +93,7 @@ code {
   left: -9999px;
   padding: 12px 20px;
   background: var(--green);
-  color: #f4f3e8;
+  color: #fdfbf8;
   z-index: 20;
 }
 .skip-link:focus {

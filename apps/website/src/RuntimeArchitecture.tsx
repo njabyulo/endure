@@ -1,75 +1,100 @@
+import { Icon, Mark } from "./Icons";
 export function RuntimeArchitecture() {
   return (
     <section
-      className="architecture content-inset"
+      className="architecture story-panel content-inset"
       id="runtime"
       aria-labelledby="runtime-title"
     >
       <div className="architecture-copy">
-        <span className="eyebrow">02 / HOW IT WORKS</span>
+        <span className="eyebrow">03 / FREEDOM, WITH BOUNDARIES</span>
         <h2 id="runtime-title">
-          Your code runs in V8.<br />
-          <em>Its authority lives in Rust.</em>
+          Big plans.
+          <br />
+          <em>Thoughtful permissions.</em>
         </h2>
         <p>
-          Agent code uses the APIs exposed by the host. Rust checks network
-          permission, records supported operations, and delivers their outcomes
-          back to JavaScript.
+          Your JavaScript and TypeScript run in V8. The Rust host checks
+          authority before an external operation leaves the runtime.
         </p>
         <dl className="boundary-notes">
           <div>
-            <dt>Permission before connection.</dt>
-            <dd>Network access is denied by default. A denied fetch throws in the host callback before a socket opens.</dd>
+            <dt>
+              <Icon name="shield" size={16} /> Permission before connection.
+            </dt>
+            <dd>
+              Agent requests and operator grants intersect. Missing permissions
+              stay denied.
+            </dd>
           </div>
           <div>
-            <dt>A record before continuation.</dt>
-            <dd>For a new durable GET, intent commits before dispatch. Its outcome commits before the promise settles.</dd>
+            <dt>
+              <Icon name="check" size={16} /> A record before continuation.
+            </dt>
+            <dd>
+              Supported operation outcomes commit before they return to
+              JavaScript.
+            </dd>
           </div>
           <div>
-            <dt>Execution with a budget.</dt>
-            <dd>The CLI bounds active execution time and V8-managed heap usage. These are not total process-memory limits or an OS sandbox.</dd>
+            <dt>
+              <Icon name="bolt" size={16} /> Resources with a boundary.
+            </dt>
+            <dd>
+              Configure token, spend, concurrency and deadline limits. Active
+              execution and V8 heap limits remain separate.
+            </dd>
           </div>
         </dl>
+        <a className="button button-light" href="#feature-1">
+          Explore capability permissions <Icon name="arrow" size={14} />
+        </a>
       </div>
       <figure className="runtime-diagram">
-        <div className="diagram-node agent-node">
-          <span>AGENT CODE</span>
-          <strong>JavaScript / TypeScript</strong>
+        <div className="agent-node diagram-node">
+          <Mark />
+          <div>
+            <span>YOUR AGENT</span>
+            <strong>A world of ideas.</strong>
+            <code>ctx.tools.call(…)</code>
+          </div>
         </div>
-        <div className="diagram-connector" aria-hidden="true">↓</div>
-        <div className="diagram-node">
-          <span>EXECUTION</span>
-          <strong>V8 isolate</strong>
-          <code>fetch(endpoint)</code>
-        </div>
-        <div className="diagram-connector">
-          <span>host call</span><span aria-hidden="true">↓</span>
+        <div className="diagram-connector" aria-hidden="true">
+          ↓
         </div>
         <div className="host-boundary">
-          <div className="diagram-node">
-            <span>RUST HOST BOUNDARY</span>
-            <strong>Check network permission</strong>
-          </div>
+          <span className="eyebrow">RUST HOST / CHECK AUTHORITY</span>
+          <h3>Only the doors you open.</h3>
           <div className="permission-paths">
-            <div className="denied-path">
-              <span>DENIED</span><strong>Throw permission error</strong>
-              <small>No socket opened</small>
-            </div>
             <div className="allowed-path">
-              <span>ALLOWED · NEW GET</span>
-              <ol>
-                <li>Commit intent</li>
-                <li>Dispatch request</li>
-                <li>Commit outcome</li>
-                <li>Settle promise</li>
-              </ol>
+              <Icon name="check" size={18} />
+              <span>ALLOWED</span>
+              <strong>
+                Record. Dispatch.
+                <br />
+                Commit. Continue.
+              </strong>
+              <small>Configured tool + grant</small>
+            </div>
+            <div className="denied-path">
+              <Icon name="shield" size={18} />
+              <span>DENIED</span>
+              <strong>
+                Stop before
+                <br />
+                external dispatch.
+              </strong>
+              <small>No matching grant</small>
             </div>
           </div>
-          <div className="journal-footnote">SQLite WAL · recorded operation history</div>
+        </div>
+        <div className="journal-footnote">
+          <span className="status-dot" /> SQLite journal · committed operation
+          history
         </div>
         <figcaption>
-          During replay, a completed recorded GET supplies its outcome from
-          history. No new request is sent for that operation.
+          Host-enforced capabilities govern registered operations. They do not
+          provide an OS sandbox.
         </figcaption>
       </figure>
     </section>

@@ -46,3 +46,8 @@ React text. The highlighter and grammars are excluded from the browser bundle.
 Add feature snippets to `src/feature-data.ts` (set `syntax` for YAML or shell),
 and installation snippets to `src/installation-code.ts`; the next dev-server
 restart or build regenerates their highlighting. Copy buttons retain raw source.
+
+The brighter illustrated layout uses native HTML, CSS and SVG artwork: a sky-blue
+workflow hero, three pastel storytelling panels, and runnable example cards.
+Workflow boards and memory cards are illustrations of supported APIs; they are
+not screenshots of a separate application or live runtime activity.
