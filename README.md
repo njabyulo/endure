@@ -188,6 +188,9 @@ GET-only fetch, one-shot timers and recorded clocks/randomness in durable runs.
 Legacy `permissions: [net]` retains broad network access for ordinary scripts;
 scoped agent requests do not inherit it. Legacy durable-script globals remain
 only for compatibility and old journal replay; new agent examples use `ctx`.
+New runs record the agent API version. Captured agents without that marker keep
+their historical globals when parked, resumed, or replayed; newly created
+children inherit the captured parent's compatibility version.
 
 Relative imports must name `.js`/`.ts` files and stay inside the entry directory
 through canonical paths. The captured `"ondure"` built-in is the only package-like

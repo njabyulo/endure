@@ -22,3 +22,7 @@ receive explicit subsets of parent capabilities and reserved parent resources.
 A child does not receive the parent's network or tool grants automatically.
 See [the MCP profile](../../docs/mcp.md) and
 [the integrated onboarding crash example](../onboarding/README.md).
+
+When `ONDURE_BIN` is unset, the runner builds the CLI before starting its local
+server or applying per-invocation timeouts. A cold build is not part of the
+30-second workflow invocation allowance.

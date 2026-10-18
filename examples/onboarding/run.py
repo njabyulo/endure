@@ -1,4 +1,6 @@
 """Exercise actual process interruption against local idempotent fixtures."""
+import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -7,6 +9,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -112,7 +115,44 @@ def invoke(path, *args):
     return result
 
 
+def worker_lease_path(journal, run_id):
+    # Match RunLease's canonical path and OS lock, without guessing a process PID.
+    lease_dir = Path(str(journal.resolve()) + ".leases")
+    lease_name = hashlib.sha256(("run:" + run_id).encode()).hexdigest()
+    return lease_dir / lease_name
+
+
+def assert_worker_holds_lease(journal, run_id):
+    # This also verifies that Python and Rust are observing the same OS lock.
+    with worker_lease_path(journal, run_id).open("r+b") as lease:
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        fcntl.flock(lease, fcntl.LOCK_UN)
+        raise AssertionError("dispatching worker does not hold its run lease")
+
+
+def wait_for_worker_release(journal, run_id):
+    deadline = time.monotonic() + 15
+    with worker_lease_path(journal, run_id).open("r+b") as lease:
+        while True:
+            try:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lease, fcntl.LOCK_UN)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise AssertionError("killed CLI worker still holds its run lease")
+                time.sleep(0.01)
+
+
 def main():
+    if not os.environ.get("ONDURE_BIN"):
+        # Cold compilation is deliberately outside each invocation's timeout.
+        subprocess.run(["cargo", "build", "--quiet", "--manifest-path",
+                        str(ROOT / "Cargo.toml"), "--bin", "ondure"],
+                       cwd=ROOT, check=True)
     server = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -148,10 +188,12 @@ def main():
                 approval.kill()
                 out, err = approval.communicate(timeout=5)
                 raise AssertionError(f"mock effect never dispatched: {out}\n{err}")
+            assert_worker_holds_lease(journal, run_id)
             approval.kill()  # SIGKILL on Unix; supervisor liveness pipe ends its worker.
             approval.communicate(timeout=5)
             assert approval.returncode == -signal.SIGKILL
             approval = None
+            wait_for_worker_release(journal, run_id)
             Receiver.release.set()
             # Recovery must use captured modules/config rather than mutable files.
             for name in ["main.js", "reviewer.js", "ondure.yaml"]:

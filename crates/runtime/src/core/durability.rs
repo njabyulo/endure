@@ -21,6 +21,15 @@ pub(crate) fn digest(value: &Value) -> String {
     format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
 }
 
+fn uses_legacy_agent_api(snapshot: &Value) -> Result<bool, String> {
+    match snapshot.get("agent_api_version") {
+        None => Ok(true),
+        Some(value) if value.as_u64() == Some(0) => Ok(true),
+        Some(value) if value.as_u64() == Some(1) => Ok(false),
+        _ => Err("unsupported captured agent API version".into()),
+    }
+}
+
 pub(crate) struct Session {
     _lease: RunLease,
     pub(crate) journal: Journal,
@@ -36,6 +45,7 @@ pub(crate) struct Session {
     pub(crate) input: Value,
     pub(crate) host_config: Option<HostConfig>,
     pub(crate) capture_agent_return: bool,
+    pub(crate) legacy_agent_api: bool,
     pub(crate) child_depth: usize,
     pub(crate) children: BTreeMap<String, ModuleGraph>,
     waits: BTreeMap<u32, WaitRecord>,
@@ -110,7 +120,21 @@ impl Session {
             None => crate::integrations::children::capture(graph, host_config)?,
         };
         let capture_agent_return = child_depth > 0;
-        let mut snapshot = serde_json::json!({"graph": graph, "net": policy.net, "input": input, "agent_returns": capture_agent_return, "children":children,"child_depth":child_depth});
+        // Children created while recovering an old parent inherit its captured
+        // API compatibility, even when they did not exist before the restart.
+        let legacy_agent_api = if child_depth > 0 {
+            let parent = request_id
+                .and_then(|id| id.strip_prefix("child:"))
+                .and_then(|id| id.rsplit_once(':').map(|(parent, _)| parent))
+                .ok_or("child request missing parent identity")?;
+            let parent = journal.get_run(parent).map_err(|e| e.to_string())?;
+            let captured: Value = serde_json::from_str(&parent.graph).map_err(|e| e.to_string())?;
+            uses_legacy_agent_api(&captured)?
+        } else {
+            false
+        };
+        let mut snapshot = serde_json::json!({"graph": graph, "net": policy.net, "input": input, "agent_returns": capture_agent_return, "agent_api_version": if legacy_agent_api {0} else {1}, "children":children,"child_depth":child_depth});
+
         if let Some(config) = host_config {
             snapshot["host_config"] = serde_json::to_value(config).map_err(|e| e.to_string())?;
         }
@@ -162,6 +186,8 @@ impl Session {
             input,
             host_config: host_config.cloned(),
             capture_agent_return,
+            legacy_agent_api,
+
             child_depth,
             children,
             waits: BTreeMap::new(),
@@ -249,6 +275,7 @@ impl Session {
                 .get("child_depth")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as usize,
+            legacy_agent_api: uses_legacy_agent_api(&snapshot)?,
             capture_agent_return: snapshot
                 .get("agent_returns")
                 .and_then(Value::as_bool)

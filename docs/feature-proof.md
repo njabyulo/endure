@@ -43,3 +43,9 @@ The integrated onboarding and standard-interface fixtures explicitly use a
 10-second active execution allowance per CLI invocation so slow CI storage does
 not turn workflow correctness checks into timing benchmarks. The CLI default
 and dedicated execution-limit regression assertions remain unchanged.
+
+Captured agent API compatibility is versioned separately from return capture.
+Legacy snapshots without an API-version marker retain `globalThis.ondure`,
+including children first created during parent recovery; new agent runs omit
+that global. Regressions cover parked approval, completed replay, inherited
+child compatibility, and rejection of unsupported snapshot API versions.

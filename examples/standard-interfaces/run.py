@@ -27,6 +27,11 @@ class Handler(fixture.Handler):
 
 
 def main():
+    if not os.environ.get("ONDURE_BIN"):
+        # Cold compilation is deliberately outside each invocation's timeout.
+        subprocess.run(["cargo", "build", "--quiet", "--manifest-path",
+                        str(ROOT / "Cargo.toml"), "--bin", "ondure"],
+                       cwd=ROOT, check=True)
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.tool_calls = 0
     thread = threading.Thread(target=server.serve_forever, daemon=True)

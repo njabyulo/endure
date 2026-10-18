@@ -10,7 +10,9 @@ The runner starts local Chat Completions and MCP fixtures, creates a temporary
 project, and invokes the real CLI. No paid provider or credentials are required.
 It records a model response, parks for human approval, supplies the trusted local
 operator's answer, and kills the approving process after the mock receiver has
-committed its effect but before the runtime receives its reply. It then removes
+committed its effect but before the runtime receives its reply. It verifies the
+worker holds the run lease, waits for that OS lease to be released after the
+kill, and only then releases the withheld reply. It then removes
 the source/config files and resumes from captured modules.
 
 Recovery reuses the completed model response and human answer, retries the
@@ -23,6 +25,7 @@ not an exactly-once guarantee for arbitrary email, payments, or tool effects.
 This test demonstrates process interruption, not hardware power-loss safety.
 
 Set `ONDURE_BIN=/absolute/path/to/ondure` to use a built executable. Otherwise
-the runner uses `cargo run` from the repository manifest. Temporary journals are
+the runner prebuilds the binary before starting any timed CLI invocation, then
+uses `cargo run` from the repository manifest. Temporary journals are
 removed on completion. The explicit operator answer is automated test input,
 not remote authentication or delivery to a human recipient.
