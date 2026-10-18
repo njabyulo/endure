@@ -272,7 +272,7 @@ function App() {
               Documentation ↗
             </a>
             <a
-              href={`${GITHUB}/blob/main/Cargo.toml`}
+              href={`${GITHUB}/blob/feat/agent-runtime-website/LICENSE`}
               target="_blank"
               rel="noreferrer"
             >

@@ -3,6 +3,12 @@ import { describe, expect, it, vi } from "vitest";
 import App from "./App";
 
 describe("landing page controls", () => {
+  it("links the declared license to its full repository terms", () => {
+    render(<App />);
+    expect(screen.getByRole("link", { name: "MIT license ↗" })).toHaveAttribute(
+      "href", "https://github.com/njabyulo/endure/blob/feat/agent-runtime-website/LICENSE",
+    );
+  });
   it("opens and closes mobile navigation, including Escape and anchor selection", () => {
     render(<App />);
     const toggle = screen.getByRole("button", { name: "Open menu" });
