@@ -89,7 +89,7 @@ impl Journal {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: u32 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 2 {
+        if version > 3 {
             return Err(JournalError(format!(
                 "journal: unsupported schema version {version}"
             )));
@@ -151,6 +151,10 @@ impl Journal {
                 );",
             )?;
             transaction.pragma_update(None, "user_version", 2)?;
+        }
+        if version < 3 {
+            transaction.execute_batch(super::memory::SCHEMA)?;
+            transaction.pragma_update(None, "user_version", 3)?;
         }
         transaction.commit()?;
         Ok(Self { connection })
@@ -343,6 +347,47 @@ impl Journal {
         write_completions(&transaction, run_id, &[(seq, result.to_owned())])?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn memory_operation(
+        &mut self,
+        run_id: &str,
+        intents: &[OpIntent],
+        seq: u64,
+        name: &str,
+        args: &serde_json::Value,
+        limits: super::memory::ContextLimits,
+    ) -> Result<serde_json::Value, JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        write_intents(&transaction, run_id, intents)?;
+        let existing: Option<String> = transaction.query_row(
+            "SELECT result FROM operations WHERE run_id=?1 AND seq=?2",
+            params![run_id, seq],
+            |row| row.get(0),
+        )?;
+        if let Some(existing) = existing {
+            return serde_json::from_str(&existing).map_err(|e| JournalError(e.to_string()));
+        }
+        transaction.execute_batch("SAVEPOINT memory_effect")?;
+        let result = super::memory::execute(&transaction, run_id, seq, name, args, limits)
+            .and_then(|value| {
+                super::operations::validate_json(
+                    &value,
+                    super::operations::MAX_OPERATION_RESULT_BYTES - 32,
+                    "result",
+                )?;
+                Ok(value)
+            });
+        if result.is_err() {
+            transaction.execute_batch("ROLLBACK TO memory_effect")?;
+        }
+        transaction.execute_batch("RELEASE memory_effect")?;
+        let outcome = serde_json::to_value(result).map_err(|e| JournalError(e.to_string()))?;
+        write_completions(&transaction, run_id, &[(seq, outcome.to_string())])?;
+        transaction.commit()?;
+        Ok(outcome)
     }
 
     /// Persist a wait. Only finalization publishes a quiescent parked run;
@@ -706,7 +751,7 @@ mod tests {
                 .park_wait("run", 1, "approval", None, "details")
                 .unwrap();
             journal.connection.execute_batch(
-                "DROP TABLE operation_attempts; ALTER TABLE operations DROP COLUMN args_json; PRAGMA user_version = 0;"
+                "DROP TABLE context_compactions; DROP TABLE context_messages; DROP TABLE shared_state; DROP TRIGGER memory_insert; DROP TABLE memory_search; DROP TABLE memory_facts; DROP TABLE operation_attempts; ALTER TABLE operations DROP COLUMN args_json; PRAGMA user_version = 0;"
             ).unwrap();
         }
         let journal = Journal::open(&path).unwrap();
@@ -727,7 +772,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            2
+            3
         );
         drop(journal);
         std::fs::remove_file(path).unwrap();

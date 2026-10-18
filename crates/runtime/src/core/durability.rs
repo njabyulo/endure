@@ -470,6 +470,30 @@ impl Session {
         result
     }
 
+    pub(crate) fn memory_op(
+        &mut self,
+        name: &str,
+        args: &Value,
+        limits: super::memory::ContextLimits,
+    ) -> Result<Value, String> {
+        let seq = self.intent(OperationSpec::new(name, RecoveryPolicy::RetrySafe), args)?;
+        let outcome =
+            if let Some(recorded) = self.history.get(&seq).filter(|op| op.state == "completed") {
+                let encoded = recorded.result.clone().ok_or("recorded result missing")?;
+                self.consume(seq)?;
+                serde_json::from_str::<Value>(&encoded).map_err(|e| e.to_string())?
+            } else {
+                let outcome = self
+                    .journal
+                    .memory_operation(&self.run_id, &self.intents, seq, name, args, limits)
+                    .map_err(|e| e.to_string())?;
+                self.intents.clear();
+                self.last_flush = Instant::now();
+                outcome
+            };
+        serde_json::from_value::<Result<Value, String>>(outcome).map_err(|e| e.to_string())?
+    }
+
     pub(crate) fn finish(&mut self, status: &str, output: &RunOutput) -> Result<(), String> {
         let status = if status == "done" && self.should_park() {
             "parked"
