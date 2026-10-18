@@ -306,3 +306,9 @@ would exceed the limit is rejected before allocating its Rust string copy;
 execution terminates with `console output limit exceeded`, preserving earlier
 captured output. The supervisor streams output without retaining another copy.
 This cap covers console retention, not every host allocation or total RSS.
+
+Agents can keep run-local conversation context, scoped lexical memory, and
+versioned shared JSON state. The [memory example](examples/agent-memory/README.md)
+includes the API contract, operator scope grants, configurable compaction limits,
+and a local runnable workflow. Memory/state mutations and their recorded outcomes
+commit atomically; completed retrievals and state results replay from the journal.

@@ -5,3 +5,5 @@ pub(crate) mod determinism;
 pub(crate) mod policy;
 
 pub(crate) mod config;
+
+pub(crate) mod memory;
