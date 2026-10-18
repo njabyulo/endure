@@ -85,6 +85,7 @@ impl Fixture {
                 model: "fixture".into(),
                 credential: None,
                 max_output_tokens: 10,
+                timeout_seconds: 30,
                 retry_interrupted: false,
             }),
             resources,
