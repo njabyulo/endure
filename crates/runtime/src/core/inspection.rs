@@ -1,7 +1,10 @@
 //! Read recorded inputs and outcomes without invoking adapters or model inference.
 use super::journal::Journal;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 /// Inspect recorded application data. Supplied rationale may appear in inputs or
 /// outcomes; this never reconstructs or requests hidden model reasoning.
@@ -30,16 +33,20 @@ pub fn diff_runs(path: &Path, first: &str, second: &str) -> Result<Value, String
     let b = inspect_run(path, second)?;
     let left = a["operations"].as_array().ok_or("missing operations")?;
     let right = b["operations"].as_array().ok_or("missing operations")?;
+    let left = indexed(left)?;
+    let right = indexed(right)?;
+    let sequences: BTreeSet<_> = left.keys().chain(right.keys()).copied().collect();
     let mut changes = Vec::new();
-    for seq in 0..left.len().max(right.len()) {
-        let before = left.get(seq);
-        let after = right.get(seq);
+    for sequence in sequences {
+        let before = left.get(&sequence);
+        let after = right.get(&sequence);
         if before != after {
-            changes.push(json!({"sequence": seq, "before": before, "after": after}));
+            changes.push(json!({"sequence":sequence,"before":before,"after":after}));
         }
     }
     let mut metadata = Vec::new();
     for field in [
+        "request_id",
         "status",
         "code_hash",
         "input",
@@ -61,8 +68,8 @@ pub fn diff_runs(path: &Path, first: &str, second: &str) -> Result<Value, String
     )
 }
 
-// Ownership and database insertion timestamps identify records, not differences
-// in outcomes. Full values remain available through inspect_run.
+/// Remove record ownership and insertion times from semantic comparisons;
+/// inspect_run retains the full values for examination.
 fn comparable(field: &str, value: &Value) -> Value {
     let mut value = value.clone();
     if field == "waits" {
@@ -95,4 +102,17 @@ fn comparable(field: &str, value: &Value) -> Value {
         }
     }
     value
+}
+
+/// Index persisted registrations by their journal sequence, including gaps.
+fn indexed(operations: &[Value]) -> Result<BTreeMap<u64, &Value>, String> {
+    operations
+        .iter()
+        .map(|operation| {
+            let sequence = operation["seq"]
+                .as_u64()
+                .ok_or("missing operation sequence")?;
+            Ok((sequence, operation))
+        })
+        .collect()
 }

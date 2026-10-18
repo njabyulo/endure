@@ -118,3 +118,48 @@ fn matching_approvals_and_accounting_ignore_record_ownership_and_timestamps() {
     drop(journal);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn sparse_operation_sequences_report_stored_keys_and_request_identity() {
+    let path = std::env::temp_dir().join(format!(
+        "ondure-sparse-diff-{}.sqlite3",
+        uuid::Uuid::new_v4()
+    ));
+    let mut journal = Journal::open(&path).unwrap();
+    for (run, request, sequences) in [("a", "first", vec![0, 2]), ("b", "second", vec![0, 3])] {
+        journal
+            .create_run(run, Some(request), "hash", "input", "{}")
+            .unwrap();
+        for seq in sequences {
+            journal
+                .intents(
+                    run,
+                    &[OpIntent {
+                        seq,
+                        name: "mock".into(),
+                        args_digest: "same".into(),
+                        args_json: Some("{}".into()),
+                        policy: "safe".into(),
+                    }],
+                )
+                .unwrap();
+        }
+    }
+    let diff = diff_runs(&path, "a", "b").unwrap();
+    assert_eq!(diff["operations"].as_array().unwrap().len(), 2);
+    assert_eq!(diff["operations"][0]["sequence"], 2);
+    assert_eq!(diff["operations"][0]["before"]["seq"], 2);
+    assert!(diff["operations"][0]["after"].is_null());
+    assert_eq!(diff["operations"][1]["sequence"], 3);
+    assert!(diff["operations"][1]["before"].is_null());
+    assert_eq!(diff["operations"][1]["after"]["seq"], 3);
+    assert!(diff["metadata"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|change| change["field"] == "request_id"
+            && change["before"] == "first"
+            && change["after"] == "second"));
+    drop(journal);
+    std::fs::remove_file(path).unwrap();
+}
