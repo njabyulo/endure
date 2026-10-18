@@ -47,6 +47,7 @@ impl Fixture {
             while !s.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         let (h, a, m, t) = (h.clone(), a.clone(), m.clone(), t.clone());
                         workers.push(thread::spawn(move||{stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();let mut request=Vec::new();let mut bytes=[0;4096];loop{let n=stream.read(&mut bytes).unwrap_or(0);if n==0{break}request.extend_from_slice(&bytes[..n]);if let Some(end)=request.windows(4).position(|p|p==b"\r\n\r\n"){let len=String::from_utf8_lossy(&request[..end]).lines().find_map(|l|l.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|n|n.parse::<usize>().ok())).unwrap_or(0);if request.len()>=end+4+len{break}}}
   h.fetch_add(1,Ordering::SeqCst);t.lock().unwrap().push(Instant::now());let current=a.fetch_add(1,Ordering::SeqCst)+1;m.fetch_max(current,Ordering::SeqCst);thread::sleep(Duration::from_millis(delay));
@@ -189,11 +190,18 @@ fn parked_time_consumes_elapsed_deadline_without_dispatch_after_wake() {
     let f = Fixture::new(0, true);
     let p=Project::new(&f.origin,"try{await ctx.sleep('1h')}catch(e){console.log(e.message)}try{await ctx.model.call('late')}catch(e){console.log(e.message)}");
     let run = p.run(&f.config(ResourceLimits {
-        elapsed_deadline_ms: Some(20),
+        elapsed_deadline_ms: Some(3_600_000),
         ..Default::default()
     }));
     assert_eq!(run.status, "parked");
-    thread::sleep(Duration::from_millis(30));
+    let connection = rusqlite::Connection::open(p.journal()).unwrap();
+    connection
+        .execute(
+            "UPDATE run_resources SET deadline_at=1 WHERE run_id=?1",
+            [&run.id],
+        )
+        .unwrap();
+    drop(connection);
     let outcomes = wake_ready(&p.journal()).unwrap();
     assert_eq!(outcomes.len(), 1);
     let done = outcomes.into_iter().next().unwrap().result.unwrap();
@@ -210,21 +218,21 @@ fn parked_time_consumes_elapsed_deadline_without_dispatch_after_wake() {
 }
 #[test]
 fn deadline_cancels_delivery_of_inflight_provider_result_but_keeps_reservation() {
-    let f = Fixture::new(250, true);
+    let f = Fixture::new(2_000, true);
     let p = Project::new(
         &f.origin,
         "try{await ctx.model.call('slow')}catch(e){console.log(e.message)}",
     );
     let started = Instant::now();
     let run = p.run(&f.config(ResourceLimits {
-        elapsed_deadline_ms: Some(40),
+        elapsed_deadline_ms: Some(500),
         model_input_token_estimate: 10,
         ..Default::default()
     }));
-    assert!(started.elapsed() < Duration::from_millis(220));
+    assert!(started.elapsed() < Duration::from_millis(1_500));
     assert_eq!(run.stdout, "BudgetError: elapsed deadline exceeded\n");
     assert_eq!(f.hits.load(Ordering::SeqCst), 1);
-    thread::sleep(Duration::from_millis(270));
+    thread::sleep(Duration::from_millis(2_050));
     let conn = rusqlite::Connection::open(p.journal()).unwrap();
     assert_eq!(
         conn.query_row("SELECT tokens FROM resource_reservations", [], |r| r
@@ -302,18 +310,18 @@ fn deadline_rejection_finally_cancels_visible_timer_and_replays_consistently() {
 fn late_scheduler_wake_rejects_uncommitted_wait_even_if_it_was_due_before_deadline() {
     let p = Project::new(
         "http://127.0.0.1:9",
-        "try{await ctx.sleep('10ms');console.log('late success')}catch(e){console.log(e.message)}",
+        "try{await ctx.sleep('1s');console.log('late success')}catch(e){console.log(e.message)}",
     );
     let config = HostConfig {
         resources: ResourceLimits {
-            elapsed_deadline_ms: Some(40),
+            elapsed_deadline_ms: Some(2_000),
             ..Default::default()
         },
         ..Default::default()
     };
     let run = p.run(&config);
     assert_eq!(run.status, "parked");
-    thread::sleep(Duration::from_millis(60));
+    thread::sleep(Duration::from_millis(2_100));
     let outcomes = wake_ready(&p.journal()).unwrap();
     let done = outcomes
         .into_iter()
@@ -336,7 +344,7 @@ fn previously_committed_wait_answer_replays_after_elapsed_deadline() {
     );
     let config = HostConfig {
         resources: ResourceLimits {
-            elapsed_deadline_ms: Some(40),
+            elapsed_deadline_ms: Some(3_600_000),
             ..Default::default()
         },
         ..Default::default()
@@ -345,7 +353,14 @@ fn previously_committed_wait_answer_replays_after_elapsed_deadline() {
     let mut journal = Journal::open(&p.journal()).unwrap();
     let wait = journal.waits(&run.id).unwrap()[0].seq;
     journal.answer_wait(&run.id, wait, "null").unwrap();
-    thread::sleep(Duration::from_millis(60));
+    let connection = rusqlite::Connection::open(p.journal()).unwrap();
+    connection
+        .execute(
+            "UPDATE run_resources SET deadline_at=1 WHERE run_id=?1",
+            [&run.id],
+        )
+        .unwrap();
+    drop(connection);
     assert_eq!(
         replay_run(&p.journal(), &run.id, None).unwrap().stdout,
         "saved answer\n"
