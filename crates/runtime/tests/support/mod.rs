@@ -42,6 +42,33 @@ impl Witness {
                             Ok(size) => request.extend_from_slice(&buffer[..size]),
                         }
                     }
+                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let content_length = String::from_utf8_lossy(&request[..header_end])
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    let received = request.len().saturating_sub(header_end + 4);
+                    let mut remaining = content_length.saturating_sub(received);
+                    // POST headers and body need not arrive in one read. Closing
+                    // with unread request bytes can reset the client connection.
+                    while remaining > 0 {
+                        let wanted = remaining.min(buffer.len());
+                        match stream.read(&mut buffer[..wanted]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(size) => remaining -= size,
+                        }
+                    }
+                    if remaining != 0 {
+                        continue;
+                    }
                     let response = format!(
                         "HTTP/1.1 {status} Witness\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()

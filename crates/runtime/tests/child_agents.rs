@@ -298,7 +298,11 @@ fn child_allocations_are_reserved_before_launch_and_reconciled_from_child_usage(
         RunLimits::default(),
     )
     .unwrap_err();
-    assert!(error.message.contains("token reservation exhausted"));
+    assert!(
+        error.message.contains("token reservation exhausted"),
+        "expected child token budget rejection, got: {}",
+        error.message
+    );
     assert_eq!(witness.finish(), 2);
 }
 fn child_source(snapshot: &str) -> String {
