@@ -45,6 +45,7 @@ fn crash_after_wait_registration_replays_until_a_confirmed_park_checkpoint() {
             .intents(
                 "interrupted",
                 &[OpIntent {
+                    args_json: None,
                     seq: 0,
                     name: "wait.approval".into(),
                     args_digest: format!("{:x}", Sha256::digest(details.as_bytes())),

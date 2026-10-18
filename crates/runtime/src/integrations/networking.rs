@@ -1,8 +1,9 @@
 //! GET-only fetch: authorize, register work, and build responses on completion.
 //! HTTP runs on Tokio's blocking pool; V8 handles stay on the host thread.
 
+use crate::MAX_OPERATION_RESULT_BYTES;
 use crate::{core::embedding::set_property, host::HostState};
-use std::time::Duration;
+use std::{io::Read, time::Duration};
 
 // Bound each HTTP operation, including its response body read.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -90,10 +91,20 @@ pub(crate) fn http_get(url: &str) -> Result<(u16, String), String> {
         Err(error) => return Err(error.to_string()),
     };
     let status = response.status();
-    Ok((
-        status,
-        response.into_string().map_err(|error| error.to_string())?,
-    ))
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_OPERATION_RESULT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_OPERATION_RESULT_BYTES {
+        return Err(format!(
+            "host operation response exceeds {} bytes",
+            MAX_OPERATION_RESULT_BYTES
+        ));
+    }
+    let body = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+    Ok((status, body))
 }
 
 fn response_json(

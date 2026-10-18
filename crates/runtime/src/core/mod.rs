@@ -7,6 +7,7 @@ pub(crate) mod execution;
 pub(crate) mod journal;
 pub(crate) mod microtasks;
 pub(crate) mod modules;
+pub(crate) mod operations;
 pub(crate) mod parking;
 pub(crate) mod transpilation;
 

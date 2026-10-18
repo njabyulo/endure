@@ -3,6 +3,9 @@
 use super::{
     journal::{Journal, OpIntent, OpRecord, WaitRecord},
     modules::ModuleGraph,
+    operations::{
+        validate_json, OperationIdentity, OperationSpec, RecoveryPolicy, MAX_OPERATION_RESULT_BYTES,
+    },
     parking::RunLease,
 };
 use crate::{Policy, RunOutput};
@@ -209,7 +212,14 @@ impl Session {
         )))
     }
 
-    fn intent(&mut self, name: &str, args: &Value, policy: &str) -> Result<u64, String> {
+    fn intent(&mut self, spec: OperationSpec<'_>, args: &Value) -> Result<u64, String> {
+        // Historical values predate adapter limits; verify identity without
+        // imposing new bounds on a committed replay.
+        if !self.history.contains_key(&self.next_seq) {
+            spec.validate(args)?;
+        }
+        let name = spec.name;
+        let policy = spec.recovery.journal_name();
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -222,7 +232,9 @@ impl Session {
             {
                 return self.diverge(format!("operation {seq} name or arguments changed"));
             }
-            if recorded.state == "pending" && recorded.policy != "safe" {
+            if recorded.state == "pending"
+                && !RecoveryPolicy::recorded_is_retryable(&recorded.policy)
+            {
                 return self.diverge(format!(
                     "InterruptedError: operation {seq} cannot be retried"
                 ));
@@ -236,6 +248,7 @@ impl Session {
             seq,
             name: name.into(),
             args_digest: digest(args),
+            args_json: Some(args.to_string()),
             policy: policy.into(),
         });
         Ok(seq)
@@ -246,9 +259,9 @@ impl Session {
         id: u32,
         name: &str,
         args: &Value,
-        policy: &str,
+        recovery: RecoveryPolicy,
     ) -> Result<(), String> {
-        let seq = self.intent(name, args, policy)?;
+        let seq = self.intent(OperationSpec::new(name, recovery), args)?;
         self.pending.insert(id, seq);
         if self.intents.len() >= 256 || self.last_flush.elapsed() >= Duration::from_millis(2) {
             self.flush()?;
@@ -271,7 +284,7 @@ impl Session {
                 "wait.timer"
             },
             args,
-            "safe",
+            RecoveryPolicy::RetrySafe,
         )?;
         if self.is_cached(id) {
             return Ok(());
@@ -329,7 +342,29 @@ impl Session {
         Ok(())
     }
 
+    /// Commit a dispatch attempt before contacting an external adapter.
+    pub(crate) fn begin_dispatch(&mut self, id: u32) -> Result<OperationIdentity, String> {
+        self.flush()?;
+        let sequence = *self
+            .pending
+            .get(&id)
+            .ok_or("operation missing from journal session")?;
+        if self.is_cached(id) {
+            return Err("cannot dispatch a completed operation".into());
+        }
+        self.journal
+            .begin_attempt(&self.run_id, sequence)
+            .map_err(|e| e.to_string())?;
+        Ok(OperationIdentity {
+            run_id: self.run_id.clone(),
+            sequence,
+        })
+    }
+
     pub(crate) fn complete(&mut self, id: u32, result: &Value) -> Result<(), String> {
+        if !self.is_cached(id) {
+            validate_json(result, MAX_OPERATION_RESULT_BYTES, "result")?;
+        }
         self.flush()?;
         self.waits.remove(&id);
         let seq = self
@@ -367,7 +402,7 @@ impl Session {
         args: &Value,
         produce: impl FnOnce() -> Result<Value, String>,
     ) -> Result<Value, String> {
-        let seq = self.intent(name, args, "safe")?;
+        let seq = self.intent(OperationSpec::new(name, RecoveryPolicy::RetrySafe), args)?;
         if let Some(recorded) = self.history.get(&seq) {
             if recorded.state == "completed" {
                 let encoded = recorded.result.clone().ok_or("recorded result missing")?;
@@ -376,7 +411,9 @@ impl Session {
             }
         }
         let result = produce();
-        let encoded = serde_json::to_string(&result).map_err(|e| e.to_string())?;
+        let value = serde_json::to_value(&result).map_err(|e| e.to_string())?;
+        validate_json(&value, MAX_OPERATION_RESULT_BYTES, "result")?;
+        let encoded = value.to_string();
         self.journal
             .complete_sync(&self.run_id, &self.intents, seq, &encoded)
             .map_err(|e| e.to_string())?;
@@ -426,7 +463,8 @@ pub fn journal_log(path: &Path, run_id: &str) -> Result<String, String> {
     let run = journal.get_run(run_id).map_err(|e| e.to_string())?;
     let ops = journal.operations(run_id).map_err(|e| e.to_string())?;
     let waits = journal.waits(run_id).map_err(|e| e.to_string())?;
-    serde_json::to_string_pretty(&serde_json::json!({"id": run.id, "status": run.status, "request_id": run.request_id, "code_hash": run.code_hash, "operations": ops, "waits": waits}))
+    let attempts = journal.attempts(run_id).map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&serde_json::json!({"id": run.id, "status": run.status, "request_id": run.request_id, "code_hash": run.code_hash, "operations": ops, "attempts": attempts, "waits": waits}))
         .map_err(|e| e.to_string())
 }
 

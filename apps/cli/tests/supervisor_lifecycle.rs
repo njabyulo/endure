@@ -4,20 +4,26 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
+
+static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
 
 struct Project(PathBuf);
 impl Project {
     fn new(source: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "ondure-supervisor-{}-{}",
+            "ondure-supervisor-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_PROJECT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
         fs::write(path.join("main.js"), source).unwrap();
