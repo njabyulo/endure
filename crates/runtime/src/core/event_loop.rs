@@ -10,12 +10,14 @@ use super::operations::{
 };
 use crate::{host::HostState, integrations::networking};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, Instant},
 };
 use tokio::{runtime::Runtime, task::JoinSet};
 
 pub(crate) type OperationId = u32;
+/// Deadline cancellation detached owned workers; runtime drop must not wait.
+pub(crate) struct DetachedHostWork;
 pub(crate) type JsonTask =
     Box<dyn FnOnce(OperationCancellation) -> Result<serde_json::Value, String> + Send>;
 /// Owned adapter work: no V8 handles or resolved credentials cross this boundary.
@@ -170,6 +172,7 @@ enum Completion {
     Http(HttpResult),
     Json((OperationId, Result<serde_json::Value, String>)),
     Timer(OperationId),
+    TimerDenied(OperationId, String),
     Wait((OperationId, serde_json::Value)),
     PollWaits,
 }
@@ -211,6 +214,8 @@ pub(crate) fn run(
     evaluation: Option<&v8::Global<v8::Promise>>,
 ) -> Result<(), String> {
     let mut tasks = JoinSet::new();
+    let mut immediate = VecDeque::new();
+    let mut active = BTreeMap::<OperationId, bool>::new();
     let cancellation = OperationCancellation::default();
     let _cancellation_guard = CancellationGuard(cancellation.clone());
     loop {
@@ -269,6 +274,51 @@ pub(crate) fn run(
             .borrow()
             .as_ref()
             .is_some_and(|session| session.has_history());
+        let mut schedule_at: Option<i64> = None;
+        let expired = scope
+            .get_slot::<HostState>()
+            .expect("host state installed")
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.deadline_expired());
+        if expired && !historical {
+            cancellation.cancel();
+            if !active.is_empty() {
+                scope.set_slot(DetachedHostWork);
+            }
+            tasks.abort_all();
+            tasks.detach_all();
+            for (id, is_json) in std::mem::take(&mut active) {
+                let error = "BudgetError: elapsed deadline exceeded".to_string();
+                immediate.push_back(if is_json {
+                    Completion::Json((id, Err(error)))
+                } else {
+                    Completion::Http((id, Err(error)))
+                });
+            }
+            let ids: Vec<_> = scope
+                .get_slot::<HostState>()
+                .expect("host state installed")
+                .operations
+                .borrow()
+                .timers
+                .keys()
+                .copied()
+                .collect();
+            for id in ids {
+                scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .operations
+                    .borrow_mut()
+                    .remove_timer(id);
+                immediate.push_back(Completion::TimerDenied(
+                    id,
+                    "BudgetError: elapsed deadline exceeded".into(),
+                ));
+            }
+        }
         for (id, url) in queued {
             let cached = scope
                 .get_slot::<HostState>()
@@ -295,6 +345,35 @@ pub(crate) fn run(
                 state.require_network(&url)?;
                 state.effective_capabilities.borrow().is_none()
             };
+            let admission = if let Some(session) = scope
+                .get_slot::<HostState>()
+                .expect("host state installed")
+                .session
+                .borrow_mut()
+                .as_mut()
+            {
+                session.admit_resource(id, "fetch.get", &serde_json::json!([url]))?
+            } else {
+                super::resources::Admission::Ready
+            };
+            match admission {
+                super::resources::Admission::Ready => {}
+                super::resources::Admission::Deferred(at) => {
+                    schedule_at = Some(schedule_at.map_or(at, |old| old.min(at)));
+                    scope
+                        .get_slot::<HostState>()
+                        .expect("host state installed")
+                        .operations
+                        .borrow_mut()
+                        .queued
+                        .push((id, url));
+                    continue;
+                }
+                super::resources::Admission::Denied(error) => {
+                    immediate.push_back(Completion::Http((id, Err(error))));
+                    continue;
+                }
+            }
             if let Some(session) = scope
                 .get_slot::<HostState>()
                 .expect("host state installed")
@@ -304,6 +383,7 @@ pub(crate) fn run(
             {
                 session.begin_dispatch(id)?;
             }
+            active.insert(id, false);
             let cancellation = cancellation.clone();
             let _entered = runtime.enter();
             tasks.spawn(async move {
@@ -342,9 +422,27 @@ pub(crate) fn run(
             if let Some(tool) = &job.required_tool {
                 state.require_tool(tool)?;
             }
+            let admission = if let Some(session) = state.session.borrow_mut().as_mut() {
+                session.admit_resource(id, &job.name, &job.args)?
+            } else {
+                super::resources::Admission::Ready
+            };
+            match admission {
+                super::resources::Admission::Ready => {}
+                super::resources::Admission::Deferred(at) => {
+                    schedule_at = Some(schedule_at.map_or(at, |old| old.min(at)));
+                    state.operations.borrow_mut().json_queued.push((id, job));
+                    continue;
+                }
+                super::resources::Admission::Denied(error) => {
+                    immediate.push_back(Completion::Json((id, Err(error))));
+                    continue;
+                }
+            }
             if let Some(session) = state.session.borrow_mut().as_mut() {
                 session.begin_dispatch(id)?;
             }
+            active.insert(id, true);
             let cancellation = cancellation.clone();
             let _entered = runtime.enter();
             tasks.spawn(async move {
@@ -406,7 +504,14 @@ pub(crate) fn run(
                 if is_wait {
                     Some(Completion::Wait((id, result)))
                 } else {
-                    Some(Completion::Timer(id))
+                    Some(
+                        if let Some(error) = result.get("error").and_then(serde_json::Value::as_str)
+                        {
+                            Completion::TimerDenied(id, error.to_string())
+                        } else {
+                            Completion::Timer(id)
+                        },
+                    )
                 }
             }
         } else {
@@ -428,7 +533,8 @@ pub(crate) fn run(
             };
             ready.map(Completion::Wait)
         };
-        if tasks.is_empty() && timer.is_none() && cached.is_none() {
+        let cached = cached.or_else(|| immediate.pop_front());
+        if tasks.is_empty() && timer.is_none() && cached.is_none() && schedule_at.is_none() {
             // Rejection stringification can itself run JS and enqueue work.
             let rejection = super::microtasks::take_unhandled_rejection(scope);
             if let Some(message) = rejection {
@@ -473,6 +579,9 @@ pub(crate) fn run(
             .borrow()
             .as_ref()
             .and_then(|session| session.next_wake())
+            .into_iter()
+            .chain(schedule_at)
+            .min()
             .map(|at| {
                 super::durability::epoch_millis()
                     .map(|now| Duration::from_millis(at.saturating_sub(now).max(0) as u64))
@@ -498,6 +607,7 @@ pub(crate) fn run(
         match completion {
             Completion::PollWaits => unreachable!(),
             Completion::Http((id, result)) => {
+                active.remove(&id);
                 // Commit a bounded error too: oversized responses must not leave
                 // an ambiguous pending operation or reach JavaScript.
                 let encoded = serde_json::to_value(&result).map_err(|e| e.to_string())?;
@@ -540,6 +650,7 @@ pub(crate) fn run(
                 networking::complete(scope, resolver, result);
             }
             Completion::Json((id, result)) => {
+                active.remove(&id);
                 let cached = scope
                     .get_slot::<HostState>()
                     .expect("host state installed")
@@ -614,6 +725,24 @@ pub(crate) fn run(
                         resolver.reject(scope, error);
                     }
                 }
+            }
+            Completion::TimerDenied(id, error) => {
+                if let Some(session) = scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .session
+                    .borrow_mut()
+                    .as_mut()
+                {
+                    session.complete(id, &serde_json::json!({"error":error}))?;
+                }
+                scope
+                    .get_slot::<HostState>()
+                    .expect("host state installed")
+                    .operations
+                    .borrow_mut()
+                    .remove_timer(id);
+                failure.get_or_insert(error);
             }
             Completion::Timer(id) => {
                 if let Some(session) = scope

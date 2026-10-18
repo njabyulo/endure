@@ -50,7 +50,11 @@ impl ResourceLimits {
             return Err("resource concurrency must be positive".into());
         }
         for rate in [&self.model_rate, &self.tool_rate].into_iter().flatten() {
-            if rate.max_calls == 0 || rate.window_ms == 0 {
+            if rate.max_calls == 0
+                || rate.window_ms == 0
+                || rate.max_calls > i64::MAX as u64
+                || rate.window_ms > i64::MAX as u64
+            {
                 return Err("rate limits must be positive".into());
             }
         }
@@ -93,6 +97,32 @@ fn price(tokens: u64, per_million: u64) -> Result<u64, String> {
         .ok_or("resource price overflow".into())
 }
 impl Journal {
+    /// Inspect conservative per-run accounting; micros are millionths of a dollar.
+    pub fn resource_report(&self, run: &str) -> Result<Value, String> {
+        let clock: Option<(i64, Option<i64>)> = self
+            .connection
+            .query_row(
+                "SELECT started_at,deadline_at FROM run_resources WHERE run_id=?1",
+                [run],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(db)?;
+        let mut statement=self.connection.prepare("SELECT id,seq,category,tokens,micros,state,admitted_at FROM resource_reservations WHERE run_id=?1 ORDER BY id").map_err(db)?;
+        let rows=statement.query_map([run],|r|Ok(serde_json::json!({"id":r.get::<_,i64>(0)?,"seq":r.get::<_,u64>(1)?,"category":r.get::<_,String>(2)?,"tokens":r.get::<_,u64>(3)?,"dollar_micros":r.get::<_,u64>(4)?,"state":r.get::<_,String>(5)?,"admitted_at":r.get::<_,i64>(6)?}))).map_err(db)?;
+        let rows = rows.collect::<Result<Vec<_>, _>>().map_err(db)?;
+        let tokens: u128 = rows
+            .iter()
+            .map(|v| u128::from(v["tokens"].as_u64().unwrap()))
+            .sum();
+        let micros: u128 = rows
+            .iter()
+            .map(|v| u128::from(v["dollar_micros"].as_u64().unwrap()))
+            .sum();
+        Ok(
+            serde_json::json!({"started_at":clock.map(|v|v.0),"deadline_at":clock.and_then(|v|v.1),"reserved_tokens":u64::try_from(tokens).map_err(|_|"accounting overflow")?,"reserved_dollar_micros":u64::try_from(micros).map_err(|_|"accounting overflow")?,"reservations":rows}),
+        )
+    }
     pub(crate) fn initialize_resources(
         &mut self,
         run: &str,
@@ -171,6 +201,8 @@ impl Journal {
         }
         let category = if name == "model.call" {
             "model"
+        } else if name == "agent.run" {
+            "child"
         } else {
             "tool"
         };
@@ -179,14 +211,14 @@ impl Journal {
         } else {
             (limits.tool_concurrency, &limits.tool_rate)
         };
-        let active:u64=tx.query_row("SELECT COUNT(*) FROM resource_reservations WHERE run_id=?1 AND category=?2 AND state='active'",params![run,category],|r|r.get(0)).map_err(db)?;
+        let active:u64=tx.query_row("SELECT COUNT(*) FROM resource_reservations WHERE run_id=?1 AND ((?2='model' AND category='model') OR (?2!='model' AND category!='model')) AND state='active'",params![run,category],|r|r.get(0)).map_err(db)?;
         if active >= concurrency as u64 {
             return Ok(Admission::Deferred(now.saturating_add(10)));
         }
         if let Some(rate) = rate {
             let cutoff = now
                 .saturating_sub(i64::try_from(rate.window_ms).map_err(|_| "rate window overflow")?);
-            let (count,earliest):(u64,Option<i64>)=tx.query_row("SELECT COUNT(*),MIN(admitted_at) FROM resource_reservations WHERE run_id=?1 AND category=?2 AND admitted_at>?3",params![run,category,cutoff],|r|Ok((r.get(0)?,r.get(1)?))).map_err(db)?;
+            let (count,earliest):(u64,Option<i64>)=tx.query_row("SELECT COUNT(*),MIN(admitted_at) FROM resource_reservations WHERE run_id=?1 AND ((?2='model' AND category='model') OR (?2!='model' AND category!='model')) AND admitted_at>?3",params![run,category,cutoff],|r|Ok((r.get(0)?,r.get(1)?))).map_err(db)?;
             if count >= rate.max_calls {
                 return Ok(Admission::Deferred(
                     earliest
@@ -213,6 +245,15 @@ impl Journal {
             )?)
             .ok_or("price overflow")?;
             (tokens, micros)
+        } else if category == "child" {
+            (
+                args["allocation"]["tokens"]
+                    .as_u64()
+                    .ok_or("child token allocation missing")?,
+                args["allocation"]["dollar_micros"]
+                    .as_u64()
+                    .ok_or("child dollar allocation missing")?,
+            )
         } else {
             (0, limits.tool_estimate_micros)
         };
@@ -269,6 +310,17 @@ pub(crate) fn settle(
                 .checked_add(price(output, output_price)?)
                 .filter(|n| *n <= i64::MAX as u64)
                 .ok_or("usage price overflow")?;
+        }
+    }
+    if category == "child" && value["Ok"]["status"] == "done" {
+        if let (Some(total), Some(spent)) = (
+            value["Ok"]["usage"]["total_tokens"].as_u64(),
+            value["Ok"]["spent_dollar_micros"].as_u64(),
+        ) {
+            if total <= i64::MAX as u64 && spent <= i64::MAX as u64 {
+                tokens = total;
+                micros = spent;
+            }
         }
     }
     tx.execute(
@@ -416,6 +468,139 @@ mod tests {
             Admission::Ready
         );
         drop(j);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn child_allocation_reserves_parent_budget_and_reconciles_completed_child() {
+        let (path, mut journal) = journal();
+        let limits = ResourceLimits {
+            token_limit: Some(100),
+            dollar_limit_micros: Some(50),
+            tool_concurrency: 1,
+            ..Default::default()
+        };
+        journal
+            .initialize_resources("run", &limits, 0, false)
+            .unwrap();
+        let child = serde_json::json!({"allocation":{"tokens":80,"dollar_micros":40}});
+        assert_eq!(
+            journal
+                .admit_resource("run", 0, "agent.run", &child, &limits, 100)
+                .unwrap(),
+            Admission::Ready
+        );
+        assert!(matches!(
+            journal
+                .admit_resource("run", 1, "fetch.get", &Value::Null, &limits, 100)
+                .unwrap(),
+            Admission::Deferred(_)
+        ));
+        let tx = journal.connection.transaction().unwrap();
+        settle(
+            &tx,
+            "run",
+            0,
+            r#"{"Ok":{"status":"done","usage":{"total_tokens":5},"spent_dollar_micros":3}}"#,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            journal.resource_report("run").unwrap()["reserved_tokens"],
+            5
+        );
+        assert_eq!(
+            journal
+                .admit_resource("run", 1, "agent.run", &child, &limits, 100)
+                .unwrap(),
+            Admission::Ready
+        );
+        let tx = journal.connection.transaction().unwrap();
+        settle(&tx, "run", 1, r#"{"Ok":{"status":"parked"}}"#).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            journal.resource_report("run").unwrap()["reserved_tokens"],
+            85
+        );
+        assert!(matches!(
+            journal
+                .admit_resource("run", 2, "agent.run", &child, &limits, 100)
+                .unwrap(),
+            Admission::Denied(_)
+        ));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn reconciliation_and_completed_outcome_commit_together() {
+        let (path, mut journal) = journal();
+        let limits = ResourceLimits {
+            model_input_token_estimate: 10,
+            ..Default::default()
+        };
+        journal
+            .initialize_resources("run", &limits, 0, false)
+            .unwrap();
+        journal
+            .intents(
+                "run",
+                &[super::super::journal::OpIntent {
+                    seq: 0,
+                    name: "model.call".into(),
+                    args_digest: "digest".into(),
+                    args_json: None,
+                    policy: "never".into(),
+                }],
+            )
+            .unwrap();
+        journal
+            .admit_resource("run", 0, "model.call", &args(), &limits, 100)
+            .unwrap();
+        journal.connection.execute_batch("CREATE TRIGGER fail_outcome BEFORE UPDATE ON operations BEGIN SELECT RAISE(ABORT,'injected');END;").unwrap();
+        assert!(journal
+            .complete(
+                "run",
+                0,
+                r#"{"Ok":{"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}}"#
+            )
+            .is_err());
+        let report = journal.resource_report("run").unwrap();
+        assert_eq!(report["reserved_tokens"], 20);
+        assert_eq!(report["reservations"][0]["state"], "active");
+        assert_eq!(journal.operations("run").unwrap()[0].state, "pending");
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn schema_three_migration_preserves_history() {
+        let (path, mut journal) = journal();
+        journal
+            .intents(
+                "run",
+                &[super::super::journal::OpIntent {
+                    seq: 0,
+                    name: "clock.date".into(),
+                    args_digest: "digest".into(),
+                    args_json: None,
+                    policy: "safe".into(),
+                }],
+            )
+            .unwrap();
+        journal.complete("run", 0, "42").unwrap();
+        let before = journal.operations("run").unwrap();
+        journal
+            .connection
+            .execute_batch(
+                "DROP TABLE resource_reservations;DROP TABLE run_resources;PRAGMA user_version=3;",
+            )
+            .unwrap();
+        drop(journal);
+        let journal = Journal::open(&path).unwrap();
+        assert_eq!(journal.operations("run").unwrap(), before);
+        assert_eq!(
+            journal.resource_report("run").unwrap()["reserved_tokens"],
+            0
+        );
+        drop(journal);
         std::fs::remove_file(path).unwrap();
     }
     #[test]

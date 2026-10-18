@@ -312,3 +312,10 @@ versioned shared JSON state. The [memory example](examples/agent-memory/README.m
 includes the API contract, operator scope grants, configurable compaction limits,
 and a local runnable workflow. Memory/state mutations and their recorded outcomes
 commit atomically; completed retrievals and state results replay from the journal.
+
+Trusted `resources` configuration meters per-run token and dollar reservations,
+model/tool concurrency and rolling rate limits, and elapsed deadlines that include
+parked time. The [resource example](examples/resource-budgets/README.md) runs a
+local provider, demonstrates denial before dispatch, and verifies replay.
+Reservations use configured estimates and prices; unknown or interrupted usage
+remains reserved. These limits do not promise exact provider billing caps.

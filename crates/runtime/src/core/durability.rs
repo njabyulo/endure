@@ -453,11 +453,11 @@ impl Session {
         self.journal
             .admit_resource(&self.run_id, seq, name, args, &limits, epoch_millis()?)
     }
-    pub(crate) fn deadline_expired(&self) -> Result<bool, String> {
-        Ok(!self.sealed
+    pub(crate) fn deadline_expired(&self) -> bool {
+        !self.sealed
             && self
                 .resource_deadline
-                .is_some_and(|at| epoch_millis().is_ok_and(|now| now >= at)))
+                .is_some_and(|at| epoch_millis().is_ok_and(|now| now >= at))
     }
 
     pub(crate) fn begin_dispatch(&mut self, id: u32) -> Result<OperationIdentity, String> {

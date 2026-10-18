@@ -549,7 +549,7 @@ fn run_on_thread(
     };
 
     let limit_failure = guard.finish(&mut isolate);
-    if limit_failure.is_some() {
+    if limit_failure.is_some() || isolate.get_slot::<event_loop::DetachedHostWork>().is_some() {
         // Blocking HTTP cannot be canceled. Let its bounded worker finish in
         // the background; it owns no V8 handles and cannot deliver a result.
         runtime.shutdown_background();
